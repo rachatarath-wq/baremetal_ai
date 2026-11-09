@@ -24,6 +24,7 @@
 | `/prep` | tokenize → `data/train.bin` + `val.bin` | 2 |
 | `/train` | เทรนโมเดลไทย (รันยาวใน background) | 3 |
 | `/train-status` | ดูความคืบหน้าของ train ที่รันอยู่ | — |
+| `/auto-improve` | วน loop อัตโนมัติ: grade → boost → finetune | — |
 | `/export-model` | export checkpoint → Q8_0 v2 | 4 |
 | `/build` | คอมไพล์ `run.c` → `BOOTX64.EFI` | — |
 | `/deploy` | ชี้ `run.c` ไปที่โมเดล + ลง USB | 5 |
@@ -67,6 +68,13 @@ tokenize `thai_corpus.txt` เป็น `data/train.bin` + `data/val.bin`
 ดู loss / step / throughput / ETA ของ train ที่รันอยู่
 ```
 /train-status
+```
+
+### `/auto-improve`
+วน loop อัตโนมัติ: ตรวจข้อเท็จจริง → boost ข้อที่พลาด → finetune → วนใหม่ (แผน A)
+```
+/auto-improve              → dry-run (โชว์แผน ไม่เทรน)
+/auto-improve 5            → รันจริง 5 รอบ
 ```
 
 ### `/export-model`

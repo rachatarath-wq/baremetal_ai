@@ -150,6 +150,15 @@ def main():
         model.train()
         return out
 
+    def save_ckpt(step):
+        torch.save({
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': step,
+            'best_val_loss': best_val_loss,
+        }, os.path.join(args.out_dir, 'ckpt.pt'))
+
     # ---- train ----
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params: {n_params/1e6:.2f}M   device: {args.device}   dtype: {args.dtype}")
@@ -168,13 +177,7 @@ def main():
             losses = estimate_loss()
             print(f"step {step}: train loss {losses['train']:.4f}  val loss {losses['val']:.4f}  lr {lr:.2e}")
             best_val_loss = min(best_val_loss, losses['val'])
-            torch.save({
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'model_args': model_args,
-                'iter_num': step,
-                'best_val_loss': best_val_loss,
-            }, os.path.join(args.out_dir, 'ckpt.pt'))
+            save_ckpt(step)
 
         # forward / backward with gradient accumulation
         optimizer.zero_grad(set_to_none=True)
@@ -194,6 +197,9 @@ def main():
             print(f"step {step}: loss {running_loss:.4f}  lr {lr:.2e}  {tok_per_sec:.0f} tok/s")
             t0 = time.time()
 
+    # Always persist the final state — a finetune round can end off an
+    # eval_interval boundary, and its progress must not be silently dropped.
+    save_ckpt(args.max_iters)
     print(f"done. checkpoint -> {os.path.join(args.out_dir, 'ckpt.pt')}")
 
 
