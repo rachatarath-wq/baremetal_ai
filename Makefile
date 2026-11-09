@@ -75,7 +75,7 @@ install: $(TARGET)
 qemu: install
 	$(QEMU) -machine q35 -m 512 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
-	  -drive file=fat:rw:fat_usb,if=ide \
+	  -drive file=fat:rw:fat_usb,if=ide,format=raw \
 	  -device qemu-xhci -device usb-kbd \
 	  -vga std
 
@@ -86,7 +86,7 @@ qemu-headless: install
 	rm -f /tmp/qemu_bm.sock /tmp/qemu_shot.ppm
 	$(QEMU) -machine q35 -m 512 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
-	  -drive file=fat:rw:fat_usb,if=ide \
+	  -drive file=fat:rw:fat_usb,if=ide,format=raw \
 	  -device qemu-xhci -device usb-kbd \
 	  -display none -vga std -monitor none \
 	  -qmp unix:/tmp/qemu_bm.sock,server=on,wait=off \
