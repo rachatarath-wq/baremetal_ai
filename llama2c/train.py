@@ -36,6 +36,8 @@ def parse_args():
     p.add_argument('--data_dir', default=os.path.join(here, '..', 'data'))
     p.add_argument('--out_dir',  default=os.path.join(here, 'out_thai'))
     p.add_argument('--init_from', default='scratch', choices=['scratch', 'resume'])
+    p.add_argument('--finetune', action='store_true',
+                   help='with --init_from resume: restart the LR schedule at the resume point')
     # model architecture (keep run.c unchanged)
     p.add_argument('--dim', type=int, default=288)
     p.add_argument('--n_layers', type=int, default=6)
@@ -108,19 +110,25 @@ def main():
 
     iter_num = 0
     best_val_loss = 1e9
+    lr_offset = 0
     if args.init_from == 'resume':
         ckpt_path = os.path.join(args.out_dir, 'ckpt.pt')
         ckpt = torch.load(ckpt_path, map_location=args.device)
         model.load_state_dict(ckpt['model'])
         iter_num = ckpt.get('iter_num', 0)
         best_val_loss = ckpt.get('best_val_loss', 1e9)
-        print(f"resumed from {ckpt_path} at iter {iter_num}")
+        if args.finetune:
+            lr_offset = iter_num
+            print(f"resumed from {ckpt_path} at iter {iter_num}  (finetune: LR schedule restarts here)")
+        else:
+            print(f"resumed from {ckpt_path} at iter {iter_num}")
 
     optimizer = model.configure_optimizers(
         args.weight_decay, args.learning_rate, (args.beta1, args.beta2), device_type)
 
     # ---- cosine lr schedule ----
     def get_lr(it):
+        it -= lr_offset
         if it < args.warmup_iters:
             return args.learning_rate * it / max(1, args.warmup_iters)
         if it > args.lr_decay_iters:
