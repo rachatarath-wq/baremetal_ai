@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Build artifacts / staging
+/build/
+/build_test/
+/fat_usb/
+
+# Python
+__pycache__/
+*.pyc
+/tools/venv/
+/llama2c/__pycache__/
+/tools/__pycache__/
+
+# Third-party vendored reference (full llama2.c clone with its own .git)
+/tools/llama2.c/
+
+# Training data & checkpoints (regenerable)
+/data/
+/llama2c/out_thai/
+/thai_corpus.txt
+
+# Large binaries / backups / archives
+*.zip
+*.dmg
+*.img
+/OVMF.fd
+
+# Model checkpoints (large; regenerate via llama2.c / training, or use Git LFS)
+/stories15M.bin
+/stories15M_q80.bin
+/stories15M_thai_q80.bin
+/tinyllama_q80.bin
