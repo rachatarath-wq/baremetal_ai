@@ -16,6 +16,9 @@ __pycache__/
 # Third-party vendored reference (full llama2.c clone with its own .git)
 /tools/llama2.c/
 
+# gnu-efi (has its own nested .git; vendoring pending user decision)
+/gnu-efi/
+
 # Training data & checkpoints (regenerable)
 /data/
 /llama2c/out_thai/
