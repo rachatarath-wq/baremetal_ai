@@ -47,12 +47,19 @@ TARGET = $(BUILD)/BOOTX64.EFI
 LDFLAGS = -nostdlib -Wl,--subsystem,10 -Wl,--entry,efi_main -Wl,--dynamicbase
 LIBS    = -lgcc
 
+# QEMU smoke-test.  On Apple Silicon there is no HVF for x86_64 guests, so the
+# default TCG (software) accelerator is used.  The app boots straight from the
+# fat_usb/ directory via QEMU's vvfat driver, so `make qemu` always runs the
+# latest build -- no disk image to refresh.
+QEMU  = /opt/homebrew/bin/qemu-system-x86_64
+OVMF  = OVMF.fd
+
 all: $(TARGET)
 
 $(BUILD)/%.o: %.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/run.o: run.c | $(BUILD)
+$(BUILD)/run.o: run.c hrfont.h font.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
@@ -64,7 +71,28 @@ $(BUILD):
 install: $(TARGET)
 	cp $(TARGET) fat_usb/EFI/BOOT/BOOTX64.EFI
 
+# Interactive: open a window and type straight into the guest (F1 toggles EN/TH).
+qemu: install
+	$(QEMU) -machine q35 -m 512 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
+	  -drive file=fat:rw:fat_usb,if=ide \
+	  -device qemu-xhci -device usb-kbd \
+	  -vga std
+
+# Headless: no window, expose a QMP socket so another process can screendump.
+#   make qemu-headless                        # terminal A (stays in foreground)
+#   python3 tools/screendump.py /tmp/qemu_bm.sock /tmp/shot.ppm   # terminal B
+qemu-headless: install
+	rm -f /tmp/qemu_bm.sock /tmp/qemu_shot.ppm
+	$(QEMU) -machine q35 -m 512 \
+	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
+	  -drive file=fat:rw:fat_usb,if=ide \
+	  -device qemu-xhci -device usb-kbd \
+	  -display none -vga std -monitor none \
+	  -qmp unix:/tmp/qemu_bm.sock,server=on,wait=off \
+	  -no-reboot
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all install clean
+.PHONY: all install clean qemu qemu-headless

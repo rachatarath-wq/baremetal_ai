@@ -16,6 +16,9 @@
 #include <efi.h>
 #include <efilib.h>
 
+/* High-resolution Thai/ASCII renderer (draw_utf8_char() + font.h glyph data). */
+#include "hrfont.h"
+
 /* ----------------------------------------------------------------------------
  * Freestanding libc replacements (no <string.h> / <stdlib.h> / <ctype.h>).
  *
@@ -1078,11 +1081,11 @@ UINT64 time_in_ms(void) {
 #define THAI_BLOCK_END  0x0E7F
 
 static EFI_GRAPHICS_OUTPUT_PROTOCOL *gGop = NULL;
-static UINT8  *gFbBase = NULL;        /* framebuffer base (device memory) */
+UINT8  *gFbBase = NULL;        /* framebuffer base (device memory); extern in hrfont.h */
 static UINTN   gFbSize = 0;           /* bytes, from Mode->FrameBufferSize */
-static UINT32  gFbWidth = 0;
-static UINT32  gFbHeight = 0;
-static UINT32  gFbScanLine = 0;       /* PixelsPerScanLine (>= width) */
+UINT32  gFbWidth = 0;         /* extern in hrfont.h */
+UINT32  gFbHeight = 0;        /* extern in hrfont.h */
+UINT32  gFbScanLine = 0;      /* PixelsPerScanLine (>= width); extern in hrfont.h */
 static EFI_GRAPHICS_PIXEL_FORMAT gFbFormat = PixelBltOnly;
 static EFI_PIXEL_BITMASK gFbMask;
 
@@ -1092,7 +1095,7 @@ static UINT32 gCursorX = 0, gCursorY = 0;
 
 /* current foreground / background colours (raw framebuffer words) */
 static UINT32 gFgColor = 0x00FFFFFF;
-static UINT32 gBgColor = 0x00000000;
+UINT32 gBgColor = 0x00000000;        /* extern in hrfont.h */
 
 /* 8x16 bitmap fonts, one byte per row, MSB = leftmost pixel, FONT_H bytes per
  * glyph.  Two independent arrays:
@@ -1107,6 +1110,7 @@ static UINT32 gBgColor = 0x00000000;
  *   rows 4..11  = base consonant / vowel / digit body
  *   rows 12..15 = below-base marks (sara u/uu, phinthu)
  * A glyph whose rows are all zero renders as a blank cell. */
+#if 0 /* legacy 8x16 bitmap fonts — superseded by font.h (see hrf_draw_cp) */
 static const unsigned char font8x16_ascii[128][16] = {
     [' '] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
     ['!'] = {0x00,0x00,0x18,0x3C,0x3C,0x3C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00},
@@ -1347,6 +1351,7 @@ static const unsigned char font8x16_thai[128][16] = {
     [126] = {0x44,0x44,0x44,0x44, 0x44,0x44,0x44,0x44, 0x44,0x44,0x7C,0x00, 0x00,0x00,0x00,0x00}, /* ๾ */
     [127] = {0x44,0x44,0x44,0x44, 0x44,0x44,0x44,0x44, 0x44,0x44,0x7C,0x00, 0x00,0x00,0x00,0x00}, /* ๿ */
 };
+#endif /* legacy 8x16 fonts */
 
 /* Build a raw framebuffer pixel word for an 8-bit-per-channel RGB triple,
  * honouring the GOP pixel format (RGB8, BGR8, or arbitrary bit masks). */
@@ -1386,42 +1391,14 @@ static void fb_fill(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color) {
     }
 }
 
-/* Draw one 8x16 glyph (16-byte bitmap) at pixel (x, y) in the current
- * foreground/background colours.  Set pixels use gFgColor, cleared pixels
- * gBgColor, so each call fully overwrites its cell (which is what Backspace
- * erase relies on). */
-static void DrawGlyph(const unsigned char *glyph, UINT32 x, UINT32 y) {
-    if (gFbBase == NULL) return;
-    for (int row = 0; row < FONT_H; row++) {
-        unsigned char bits = glyph[row];
-        for (int col = 0; col < FONT_W; col++) {
-            fb_fill(x + (UINT32)col * FONT_SCALE, y + (UINT32)row * FONT_SCALE,
-                    FONT_SCALE, FONT_SCALE,
-                    (bits & (0x80 >> col)) ? gFgColor : gBgColor);
-        }
-    }
-}
-
-/* Draw one 8x16 glyph with only its set pixels: cleared (background) pixels are
- * left untouched.  Used for zero-width Thai combining marks so they overlay the
- * consonant already drawn in the same cell without erasing it. */
-static void DrawGlyphTransparent(const unsigned char *glyph, UINT32 x, UINT32 y) {
-    if (gFbBase == NULL) return;
-    for (int row = 0; row < FONT_H; row++) {
-        unsigned char bits = glyph[row];
-        for (int col = 0; col < FONT_W; col++) {
-            if (bits & (0x80 >> col))
-                fb_fill(x + (UINT32)col * FONT_SCALE, y + (UINT32)row * FONT_SCALE,
-                        FONT_SCALE, FONT_SCALE, gFgColor);
-        }
-    }
-}
-
-/* Draw an ASCII glyph from font8x16_ascii[] at pixel (x, y). */
-void DrawChar(char c, UINT32 x, UINT32 y) {
-    unsigned char uc = (unsigned char)c;
-    if (uc < FONT_ASCII_FIRST || uc > FONT_ASCII_LAST) uc = '?';
-    DrawGlyph(font8x16_ascii[uc], x, y);
+/* Draw the high-resolution glyph for code point `cp` at cell (cx, cy).
+ * transparent 0 = opaque (background painted over), 1 = set pixels only (used
+ * for zero-width Thai combining marks overlaid on the base consonant). */
+static void hrf_draw_cp(UINT32 cp, UINT32 cx, UINT32 cy, int transparent) {
+    const HRFONT_glyph_t *g = hrf_lookup(cp);
+    if (g == NULL) g = hrf_lookup('?');
+    const UINT8 *bmp = HRFONT_bitmap + (UINTN)(g - HRFONT_glyphs) * HRFONT_GLYPH_BYTES;
+    hrf_blit(bmp, (int)cx * HRFONT_W, (int)cy * HRFONT_H, gFgColor, gBgColor, transparent);
 }
 
 static void fb_scroll(void) {
@@ -1440,10 +1417,10 @@ static void fb_newline(void) {
     }
 }
 
-/* Draw one glyph bitmap at the cursor and advance. */
-static void fb_put_glyph(const unsigned char *glyph) {
+/* Draw the high-res glyph for `cp` at the cursor and advance one cell. */
+static void fb_put_glyph_hr(UINT32 cp) {
     if (gFbBase == NULL) return;
-    DrawGlyph(glyph, gCursorX * CELL_W, gCursorY * CELL_H);
+    hrf_draw_cp(cp, gCursorX, gCursorY, 0);
     gCursorX++;
     if (gCursorX >= gCols) { gCursorX = 0; fb_newline(); }
 }
@@ -1454,17 +1431,17 @@ static void fb_putc(char c) {
     if (c == '\r') { gCursorX = 0; return; }
     if (c == '\b') {
         if (gCursorX > 0) gCursorX--;
-        DrawChar(' ', gCursorX * CELL_W, gCursorY * CELL_H);
+        hrf_draw_cp(' ', gCursorX, gCursorY, 0);
         return;
     }
-    if ((unsigned char)c >= FONT_ASCII_FIRST && (unsigned char)c <= FONT_ASCII_LAST) {
-        fb_put_glyph(font8x16_ascii[(unsigned char)c]);
+    if ((unsigned char)c >= HRFONT_ASCII_FIRST && (unsigned char)c <= HRFONT_ASCII_LAST) {
+        fb_put_glyph_hr((unsigned char)c);
     }
 }
 
 /* Draw an unknown / unrepresentable character as '?'. */
 static void fb_put_unknown(void) {
-    fb_put_glyph(font8x16_ascii[(unsigned char)'?']);
+    fb_put_glyph_hr('?');
 }
 
 /* True if `cp` is a Thai combining mark that must overlay the preceding
@@ -1483,17 +1460,17 @@ static int fb_put_codepoint(UINT32 cp) {
         fb_putc((char)cp);              /* ASCII, incl. \n \r \b */
         return 1;
     }
-    if (cp >= THAI_BLOCK_BASE && cp <= THAI_BLOCK_END) {
-        const unsigned char *glyph = font8x16_thai[(int)(cp - THAI_BLOCK_BASE)];
+    if (cp >= HRFONT_THAI_BASE && cp <= HRFONT_THAI_END) {
         if (thai_is_combining_mark(cp)) {
-            /* Zero-width: draw over the previous cell (one FONT_W to the left)
+            /* Zero-width: draw over the previous cell (one cell to the left)
              * without touching gCursorX, so the next character still lands in
-             * the cell after the consonant. */
-            UINT32 target_x = (gCursorX > 0) ? (gCursorX - 1) * CELL_W : 0;
-            DrawGlyphTransparent(glyph, target_x, gCursorY * CELL_H);
+             * the cell after the consonant.  Transparent blit keeps the base
+             * consonant visible underneath the mark. */
+            UINT32 target_cx = (gCursorX > 0) ? (gCursorX - 1) : 0;
+            hrf_draw_cp(cp, target_cx, gCursorY, /*transparent=*/1);
             return 1;
         }
-        fb_put_glyph(glyph);
+        fb_put_glyph_hr(cp);
         return 1;
     }
     fb_put_unknown();                   /* unsupported: placeholder */
@@ -1903,7 +1880,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
               gFbWidth, gFbHeight, gFbSize, gFbScanLine);
 
     // --- tune these for your hardware ---
-    CHAR16 *checkpoint_name = L"\\stories15M_q80.bin";
+    CHAR16 *checkpoint_name = L"\\stories15M_thai_q80.bin";
     CHAR16 *tokenizer_name  = L"\\tokenizer.bin";
     char    prompt[512];               // filled in from the keyboard at runtime
     int     steps           = 256;      // number of tokens to generate
