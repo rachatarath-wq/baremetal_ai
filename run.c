@@ -2393,6 +2393,11 @@ static int  gChatLines = 0;
 
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
+/* game mode: 0 = chat GUI, 1 = Pacman (entered via /games pacman) */
+#define GAME_MODE_NONE   0
+#define GAME_MODE_PACMAN 1
+static int gGameMode = GAME_MODE_NONE;
+
 /* --- live model state: built at boot by efi_main, swapped by /loadmodel ---- */
 static Transformer gTransformer;          /* active checkpoint weights          */
 static Tokenizer   gTokenizer;            /* tokenizer for the active vocab size */
@@ -3048,6 +3053,381 @@ static void load_new_model(const char *filename) {
     gui_chat_add(buf);
 }
 
+/* ----------------------------------------------------------------------------
+ * 4b. Pacman minigame (/games pacman).  A grid maze on the raw framebuffer:
+ *     arrow keys steer Pacman, ghosts chase, dots/pellets score, ESC returns.
+ * ------------------------------------------------------------------------- */
+
+#define PAC_W 23
+#define PAC_H 23
+#define PAC_CELL       48      /* pixels per maze cell                         */
+#define PAC_TICK_US    160000  /* ~6.25 moves/sec                              */
+#define PAC_FRIGHT_TICKS 40    /* ticks ghosts stay edible after a pellet      */
+#define PAC_MAX_GHOSTS 4
+
+#define PAC_SCAN_UP    0x01
+#define PAC_SCAN_DOWN  0x02
+#define PAC_SCAN_RIGHT 0x03
+#define PAC_SCAN_LEFT  0x04
+#define PAC_SCAN_ESC   0x17
+
+/* 23x23 maze: '#' wall, '.' dot, 'o' power pellet, 'P' Pacman, 'G' ghost. */
+static const char *gPacMaze[PAC_H] = {
+    "#######################",
+    "#.o.#.....#.....#.#.#.#",
+    "##G....#...#.#.....oG.#",
+    "#.......#.#.#...#...#.#",
+    "##...#................#",
+    "#...#...#.#...#...#.#.#",
+    "#..#.#.###.#...#......#",
+    "#.....#.#.......#.#.#.#",
+    "#..#.......#.#.###....#",
+    "#...#.#.#.#.....#...#.#",
+    "#.....................#",
+    "#.#.#.....#P#.#...#.#.#",
+    "####.#.#.#.#...#.###..#",
+    "#.#.............#.#.#.#",
+    "#....#.#...#.#........#",
+    "#.#.#...#.....#.#.#.#.#",
+    "#....#.....#..........#",
+    "#.#.#...#...#.#...#.#.#",
+    "#....#................#",
+    "#.o.#...#.#.#.#.#...o.#",
+    "#.G....#...#.#......G.#",
+    "#.#.#.........#.#.#.#.#",
+    "#######################",
+};
+
+static char gPacGrid[PAC_H][PAC_W];      /* mutable copy: walls + remaining dots */
+
+static int gPacX, gPacY;                 /* Pacman cell                          */
+static int gPacDirX, gPacDirY;           /* current facing                       */
+static int gPacNextX, gPacNextY;         /* queued (buffered) turn               */
+static int gPacSpawnX, gPacSpawnY;
+
+static int gPacLives, gPacScore, gPacDotsLeft;
+static int gPacOver, gPacWon;
+
+static int gPacGhosts;
+static int gPacGhostX[PAC_MAX_GHOSTS], gPacGhostY[PAC_MAX_GHOSTS];
+static int gPacGhostDX[PAC_MAX_GHOSTS], gPacGhostDY[PAC_MAX_GHOSTS];
+static int gPacGhostSpawnX[PAC_MAX_GHOSTS], gPacGhostSpawnY[PAC_MAX_GHOSTS];
+static int gPacFright;                   /* remaining edible ticks (0 = normal) */
+
+static UINT64 gPacAccum;                 /* tick accumulator, microseconds       */
+static int gPacOX, gPacOY;               /* maze origin, px                      */
+
+static UINT32 gPacBg, gPacWall, gPacWallHi, gPacDot, gPacPellet, gPacPac;
+static UINT32 gPacGhostCol[PAC_MAX_GHOSTS], gPacFrightCol, gPacWhite, gPacBlack;
+static UINT32 gPacText;
+
+static int pac_abs(int v) { return v < 0 ? -v : v; }
+static int pac_wall(int x, int y) {
+    if (x < 0 || y < 0 || x >= PAC_W || y >= PAC_H) return 1;
+    return gPacGrid[y][x] == '#';
+}
+
+static void pac_fill_circle(int cx, int cy, int r, UINT32 c) {
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx * dx + dy * dy <= r * r)
+                DrawPixel((UINT32)(cx + dx), (UINT32)(cy + dy), c);
+}
+
+/* Filled triangle via bounding box + edge side test. */
+static void pac_fill_tri(int x0, int y0, int x1, int y1, int x2, int y2, UINT32 c) {
+    int minx = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2);
+    int maxx = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
+    int miny = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    int maxy = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    for (int y = miny; y <= maxy; y++)
+        for (int x = minx; x <= maxx; x++) {
+            int a = (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0);
+            int b = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1);
+            int cc = (x0 - x2) * (y - y2) - (y0 - y2) * (x - x2);
+            if (!((a < 0 || b < 0 || cc < 0) && (a > 0 || b > 0 || cc > 0)))
+                DrawPixel((UINT32)x, (UINT32)y, c);
+        }
+}
+
+static void pac_draw_cell(int x, int y) {
+    int px = gPacOX + x * PAC_CELL, py = gPacOY + y * PAC_CELL;
+    int cx = px + PAC_CELL / 2, cy = py + PAC_CELL / 2;
+    char c = gPacGrid[y][x];
+    if (c == '#') {
+        draw_filled_rect(px + 1, py + 1, PAC_CELL - 2, PAC_CELL - 2, gPacWall);
+        draw_filled_rect(px + 2, py + 2, PAC_CELL - 4, 5, gPacWallHi);
+        draw_filled_rect(px + 2, py + 2, 5, PAC_CELL - 4, gPacWallHi);
+    } else if (c == '.') {
+        pac_fill_circle(cx, cy, 5, gPacDot);
+    } else if (c == 'o') {
+        pac_fill_circle(cx, cy, 12, gPacPellet);
+    }
+}
+
+static void pac_draw_pacman(void) {
+    int cx = gPacOX + gPacX * PAC_CELL + PAC_CELL / 2;
+    int cy = gPacOY + gPacY * PAC_CELL + PAC_CELL / 2;
+    pac_fill_circle(cx, cy, PAC_CELL / 2 - 4, gPacPac);
+    int dx = gPacDirX, dy = gPacDirY;
+    if (dx == 0 && dy == 0) { dx = 1; dy = 0; }
+    int px = -dy, py = dx;               /* perpendicular of the facing vector */
+    pac_fill_tri(cx, cy,
+                 cx + dx * 10 + px * 10, cy + dy * 10 + py * 10,
+                 cx + dx * 10 - px * 10, cy + dy * 10 - py * 10,
+                 gPacBg);
+}
+
+static void pac_draw_ghost(int i) {
+    int cx = gPacOX + gPacGhostX[i] * PAC_CELL + PAC_CELL / 2;
+    int cy = gPacOY + gPacGhostY[i] * PAC_CELL + PAC_CELL / 2;
+    UINT32 body = gPacFright ? gPacFrightCol : gPacGhostCol[i];
+    int r = PAC_CELL / 2 - 9;
+    pac_fill_circle(cx, cy - 5, r, body);
+    draw_filled_rect(cx - r, cy - 5, 2 * r, r + 9, body);
+    pac_fill_circle(cx - r + 4, cy + r + 2, 4, body);   /* three wavy "feet" */
+    pac_fill_circle(cx,           cy + r + 2, 4, body);
+    pac_fill_circle(cx + r - 4, cy + r + 2, 4, body);
+    pac_fill_circle(cx - 7, cy - 7, 5, gPacWhite);      /* eyes               */
+    pac_fill_circle(cx + 7, cy - 7, 5, gPacWhite);
+    int pr = gPacFright ? 2 : 3;
+    pac_fill_circle(cx - 7, cy - 7, pr, gPacBlack);
+    pac_fill_circle(cx + 7, cy - 7, pr, gPacBlack);
+}
+
+static void pac_draw_hud(void) {
+    char buf[48];
+    int n;
+    const char *p;
+
+    gui_text((int)(gFbWidth - 6 * HRFONT_W) / 2, 40, "PACMAN", gPacText, gPacBg);
+
+    n = 0;
+    for (p = "SCORE "; *p; p++) buf[n++] = *p;
+    gui_itoa(gPacScore, buf + n); while (buf[n]) n++;
+    buf[n] = '\0';
+    gui_text(gPacOX, 104, buf, gPacText, gPacBg);
+
+    n = 0;
+    for (p = "LIVES "; *p; p++) buf[n++] = *p;
+    gui_itoa(gPacLives, buf + n); while (buf[n]) n++;
+    buf[n] = '\0';
+    int lw = (int)strlen(buf) * HRFONT_W;
+    gui_text(gPacOX + PAC_W * PAC_CELL - lw, 104, buf, gPacText, gPacBg);
+
+    const char *hint = "Arrows / WASD = move    Q or ESC = quit";
+    int hw = (int)strlen(hint) * HRFONT_W;
+    gui_text((int)(gFbWidth - hw) / 2, gPacOY + PAC_H * PAC_CELL + 40,
+             hint, gPacText, gPacBg);
+}
+
+static void pac_draw_over(void) {
+    const char *msg = gPacWon ? "YOU WIN!" : "GAME OVER";
+    const char *sub = "press ESC to return to chat";
+    int mw = (int)strlen(msg) * HRFONT_W;
+    int sw = (int)strlen(sub) * HRFONT_W;
+    int w = (mw > sw ? mw : sw) + 64;
+    int h = 96;
+    int x = (int)(gFbWidth - w) / 2;
+    int y = gPacOY + PAC_H * PAC_CELL / 2 - h / 2;
+    UINT32 bg = fb_make_color(0x10, 0x14, 0x1A);
+    draw_filled_rect(x, y, w, h, bg);
+    draw_rect(x, y, w, h, gColBorder);
+    gui_text(x + (w - mw) / 2, y + 16, msg, gPacPac, bg);
+    gui_text(x + (w - sw) / 2, y + 16 + HRFONT_H, sub, gColText, bg);
+}
+
+static void pac_draw(void) {
+    fb_fill(0, 0, gFbWidth, gFbHeight, gPacBg);
+    for (int y = 0; y < PAC_H; y++)
+        for (int x = 0; x < PAC_W; x++)
+            pac_draw_cell(x, y);
+    for (int i = 0; i < gPacGhosts; i++) pac_draw_ghost(i);
+    pac_draw_pacman();
+    pac_draw_hud();
+    if (gPacOver) pac_draw_over();
+}
+
+static void pac_respawn(void) {
+    gPacX = gPacSpawnX; gPacY = gPacSpawnY;
+    gPacDirX = 1; gPacDirY = 0; gPacNextX = 1; gPacNextY = 0;
+    for (int i = 0; i < gPacGhosts; i++) {
+        gPacGhostX[i] = gPacGhostSpawnX[i];
+        gPacGhostY[i] = gPacGhostSpawnY[i];
+        gPacGhostDX[i] = 1; gPacGhostDY[i] = 0;
+    }
+    gPacFright = 0;
+}
+
+static void pac_init(void) {
+    gPacOX = ((int)gFbWidth - PAC_W * PAC_CELL) / 2;
+    gPacOY = 180;
+    gPacLives = 3;
+    gPacScore = 0;
+    gPacDotsLeft = 0;
+    gPacOver = 0;
+    gPacWon = 0;
+    gPacFright = 0;
+    gPacAccum = 0;
+    gPacDirX = 1; gPacDirY = 0; gPacNextX = 1; gPacNextY = 0;
+    gPacGhosts = 0;
+
+    for (int y = 0; y < PAC_H; y++) {
+        for (int x = 0; x < PAC_W; x++) {
+            char c = gPacMaze[y][x];
+            if (c == 'P') {
+                gPacX = x; gPacY = y; gPacSpawnX = x; gPacSpawnY = y;
+                c = ' ';
+            } else if (c == 'G') {
+                if (gPacGhosts < PAC_MAX_GHOSTS) {
+                    gPacGhostX[gPacGhosts] = x; gPacGhostY[gPacGhosts] = y;
+                    gPacGhostSpawnX[gPacGhosts] = x; gPacGhostSpawnY[gPacGhosts] = y;
+                    gPacGhostDX[gPacGhosts] = 1; gPacGhostDY[gPacGhosts] = 0;
+                    gPacGhosts++;
+                }
+                c = ' ';
+            }
+            if (c == '.' || c == 'o') gPacDotsLeft++;
+            gPacGrid[y][x] = c;
+        }
+    }
+
+    gPacBg        = fb_make_color(0x00, 0x00, 0x00);
+    gPacWall      = fb_make_color(0x1F, 0x33, 0x99);
+    gPacWallHi    = fb_make_color(0x4A, 0x6C, 0xE0);
+    gPacDot       = fb_make_color(0xF6, 0xD8, 0x8A);
+    gPacPellet    = fb_make_color(0xFF, 0xE0, 0x9A);
+    gPacPac       = fb_make_color(0xFF, 0xE0, 0x00);
+    gPacGhostCol[0] = fb_make_color(0xFF, 0x3B, 0x3B);
+    gPacGhostCol[1] = fb_make_color(0xFF, 0xB8, 0xDE);
+    gPacGhostCol[2] = fb_make_color(0x3B, 0xFF, 0xFF);
+    gPacGhostCol[3] = fb_make_color(0xFF, 0xB8, 0x5A);
+    gPacFrightCol = fb_make_color(0x20, 0x40, 0xC0);
+    gPacWhite     = fb_make_color(0xFF, 0xFF, 0xFF);
+    gPacBlack     = fb_make_color(0x00, 0x00, 0x00);
+    gPacText      = fb_make_color(0xE6, 0xE6, 0xE6);
+
+    if (mouse_available()) mouse_restore();   /* erase pointer while playing */
+    pac_draw();
+}
+
+static void pac_move_pacman(void) {
+    int ox = gPacX, oy = gPacY;
+    /* apply a buffered turn first, then keep going in the facing direction */
+    if (gPacNextX || gPacNextY) {
+        int tx = gPacX + gPacNextX, ty = gPacY + gPacNextY;
+        if (!pac_wall(tx, ty)) {
+            gPacX = tx; gPacY = ty;
+            gPacDirX = gPacNextX; gPacDirY = gPacNextY;
+        }
+    }
+    if (gPacX == ox && gPacY == oy) {   /* buffered turn was blocked: keep facing */
+        int tx = gPacX + gPacDirX, ty = gPacY + gPacDirY;
+        if (!pac_wall(tx, ty)) { gPacX = tx; gPacY = ty; }
+    }
+    char c = gPacGrid[gPacY][gPacX];
+    if (c == '.') {
+        gPacGrid[gPacY][gPacX] = ' ';
+        gPacScore += 10; gPacDotsLeft--;
+    } else if (c == 'o') {
+        gPacGrid[gPacY][gPacX] = ' ';
+        gPacScore += 50; gPacDotsLeft--;
+        gPacFright = PAC_FRIGHT_TICKS;
+    }
+}
+
+static void pac_move_ghost(int i) {
+    static const int cd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    int x = gPacGhostX[i], y = gPacGhostY[i];
+    int best = -1, bestscore = -1000000000;
+    for (int k = 0; k < 4; k++) {
+        int nx = x + cd[k][0], ny = y + cd[k][1];
+        if (pac_wall(nx, ny)) continue;
+        if (nx == x - gPacGhostDX[i] && ny == y - gPacGhostDY[i]) continue; /* no U-turn */
+        int score;
+        if (gPacFright)
+            score = (nx * 7 + ny * 13) % 4;                 /* scatter / wander */
+        else
+            score = 1000 - (pac_abs(nx - gPacX) + pac_abs(ny - gPacY));  /* chase */
+        if (cd[k][0] == gPacGhostDX[i] && cd[k][1] == gPacGhostDY[i]) score += 50;
+        if (score > bestscore) { bestscore = score; best = k; }
+    }
+    if (best < 0) {                             /* only a U-turn is possible */
+        for (int k = 0; k < 4; k++) {
+            if (!pac_wall(x + cd[k][0], y + cd[k][1])) { best = k; break; }
+        }
+    }
+    if (best < 0) return;                       /* trapped (should not happen) */
+    gPacGhostDX[i] = cd[best][0];
+    gPacGhostDY[i] = cd[best][1];
+    gPacGhostX[i] = x + gPacGhostDX[i];
+    gPacGhostY[i] = y + gPacGhostDY[i];
+}
+
+static void pac_collide(void) {
+    for (int i = 0; i < gPacGhosts; i++) {
+        if (gPacGhostX[i] == gPacX && gPacGhostY[i] == gPacY) {
+            if (gPacFright) {
+                gPacScore += 200;
+                gPacGhostX[i] = gPacGhostSpawnX[i];
+                gPacGhostY[i] = gPacGhostSpawnY[i];
+                gPacGhostDX[i] = 1; gPacGhostDY[i] = 0;
+            } else {
+                gPacLives--;
+                if (gPacLives <= 0) { gPacOver = 1; gPacWon = 0; return; }
+                pac_respawn();
+                return;
+            }
+        }
+    }
+    if (gPacDotsLeft <= 0) { gPacOver = 1; gPacWon = 1; }
+}
+
+static void pac_tick(void) {
+    if (gPacOver) return;
+    pac_move_pacman();
+    for (int i = 0; i < gPacGhosts; i++) pac_move_ghost(i);
+    if (gPacFright) gPacFright--;
+    pac_collide();
+    pac_draw();
+}
+
+static void pac_quit(void) {
+    gGameMode = GAME_MODE_NONE;
+    gui_draw_desktop();
+    if (mouse_available()) { mouse_save(); mouse_draw(); }
+}
+
+static void pac_key(EFI_INPUT_KEY key) {
+    CHAR16 ch = key.UnicodeChar;
+
+    if (gPacOver) {
+        if (key.ScanCode == PAC_SCAN_ESC || ch == CHAR_CARRIAGE_RETURN
+            || ch == 'q' || ch == 'Q' || ch == 0x1B) pac_quit();
+        return;
+    }
+
+    /* arrow keys (EFI scan codes) */
+    switch (key.ScanCode) {
+    case PAC_SCAN_LEFT:  gPacNextX = -1; gPacNextY =  0; return;
+    case PAC_SCAN_RIGHT: gPacNextX =  1; gPacNextY =  0; return;
+    case PAC_SCAN_UP:    gPacNextX =  0; gPacNextY = -1; return;
+    case PAC_SCAN_DOWN:  gPacNextX =  0; gPacNextY =  1; return;
+    case PAC_SCAN_ESC:   pac_quit(); return;
+    default: break;
+    }
+
+    /* WASD fallback (UnicodeChar) — reliable on any keyboard, incl. QMP tests */
+    switch (ch) {
+    case 'w': case 'W': gPacNextX =  0; gPacNextY = -1; break;
+    case 's': case 'S': gPacNextX =  0; gPacNextY =  1; break;
+    case 'a': case 'A': gPacNextX = -1; gPacNextY =  0; break;
+    case 'd': case 'D': gPacNextX =  1; gPacNextY =  0; break;
+    case 'q': case 'Q': case 0x1B: pac_quit(); break;
+    default: break;
+    }
+}
+
 static void process_slash_command(char *input) {
     if (input[0] != '/') return;
 
@@ -3073,6 +3453,7 @@ static void process_slash_command(char *input) {
         gui_chat_add(">   /loadmodel FILE  load a model checkpoint");
         gui_chat_add(">   /listmodel       list available models");
         gui_chat_add(">   /train           enter training mode");
+        gui_chat_add(">   /games pacman    play Pacman");
     } else if (strcmp(cmd, "loadmodel") == 0) {
         if (arg && *arg) load_new_model(arg);
         else             gui_chat_add("> usage: /loadmodel <filename>");
@@ -3088,6 +3469,13 @@ static void process_slash_command(char *input) {
     } else if (strcmp(cmd, "train") == 0) {
         gTrainingMode = 1;
         gui_chat_add("> training mode ON (placeholder)");
+    } else if (strcmp(cmd, "games") == 0) {
+        if (arg && strcmp(arg, "pacman") == 0) {
+            gGameMode = GAME_MODE_PACMAN;
+            pac_init();
+        } else {
+            gui_chat_add("> usage: /games pacman");
+        }
     } else {
         gui_chat_add2("> unknown command: /", cmd);
     }
@@ -3138,7 +3526,8 @@ static void gui_send(void) {
 
     gInputLen = 0;
     gInputBuf[0] = '\0';
-    gui_repaint_chat();   /* also repaints the now-empty input box */
+    if (gGameMode == GAME_MODE_NONE)
+        gui_repaint_chat();   /* also repaints the now-empty input box */
 }
 
 static void gui_click(int mx, int my) {
@@ -3270,6 +3659,20 @@ static void gui_init(void) {
 static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
     gRoot = root;
     for (;;) {
+        /* Pacman mode: run the game instead of the chat loop. */
+        if (gGameMode == GAME_MODE_PACMAN) {
+            EFI_INPUT_KEY key;
+            EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
+            if (ks == EFI_SUCCESS) pac_key(key);
+            gPacAccum += GUI_POLL_US;
+            if (gPacAccum >= PAC_TICK_US) {
+                gPacAccum -= PAC_TICK_US;
+                pac_tick();
+            }
+            uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            continue;
+        }
+
         /* 1. keyboard: non-blocking read; act only when a key is present */
         EFI_INPUT_KEY key;
         EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
