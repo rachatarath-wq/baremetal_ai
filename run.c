@@ -765,6 +765,23 @@ char* decode(Tokenizer* t, int prev_token, int token) {
     return piece;
 }
 
+/* Generation output sink.  generate() emits decoded token pieces through here:
+ * text mode prints to the framebuffer, the GUI captures into gGenBuf so it can
+ * route the answer into the chat log. */
+static char gGenBuf[8192];
+static int  gGenLen = 0;
+static int  gGenCapture = 0;   /* 0 = fb_puts, 1 = accumulate into gGenBuf */
+
+static void gen_emit(const char *piece) {
+    if (gGenCapture) {
+        for (const char *p = piece; *p && gGenLen < (int)sizeof(gGenBuf) - 1; p++)
+            gGenBuf[gGenLen++] = *p;
+        gGenBuf[gGenLen] = '\0';
+    } else {
+        fb_puts(piece);
+    }
+}
+
 static void safe_print(char *piece) {
     // piece might be a raw byte token, and we only want to print printable chars
     // or whitespace, because some bytes are control codes, backspace, etc.
@@ -776,7 +793,7 @@ static void safe_print(char *piece) {
             return; // bad byte, don't print it
         }
     }
-    fb_puts(piece);
+    gen_emit(piece);
 }
 
 /* Simple freestanding qsort/bsearch (element types are <= 32 bytes here). */
@@ -2013,6 +2030,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
+    if (gGenCapture) { gGenLen = 0; gGenBuf[0] = '\0'; }   /* fresh capture */
+
     // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
     int* prompt_tokens = AllocatePool((strlen(prompt) + 3) * sizeof(int));
@@ -2051,13 +2070,15 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         // init the timer here because the first iteration can be slower
         if (start == 0) { start = time_in_ms(); }
     }
-    fb_putc('\n');
+    if (!gGenCapture) {
+        fb_putc('\n');
 
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
-        UINT64 end = time_in_ms();
-        fb_printf("achieved tok/s: %f\n",
-                  (double)(pos - 1) / (double)(end - start) * 1000.0);
+        // report achieved tok/s (pos-1 because the timer starts after first iteration)
+        if (pos > 1) {
+            UINT64 end = time_in_ms();
+            fb_printf("achieved tok/s: %f\n",
+                      (double)(pos - 1) / (double)(end - start) * 1000.0);
+        }
     }
 
     FreePool(prompt_tokens);
@@ -2328,6 +2349,7 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 #define EMOTION_PANEL_H    52    /* panel height, px                            */
 #define EMOTION_THINK_US   600000 /* simulated "thinking" pause, microseconds   */
 #define EMOTION_HOLD_LOOPS 250   /* answer mood -> idle after ~2.5 s (10ms ticks) */
+#define GUI_GEN_STEPS      128   /* max tokens the model generates per answer    */
 
 typedef struct { int x, y, w, h; } GuiRect;
 
@@ -3084,16 +3106,33 @@ static void gui_send(void) {
         gui_chat_add2("You: ", gInputBuf);
 
         gui_set_emotion(EMOTION_THINKING);              /* "thinking hard"   */
-        uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
 
         if (strncmp(gInputBuf, "จำไว้", strlen("จำไว้")) == 0) {
             kb_remember(gRoot, gInputBuf + strlen("จำไว้"));   /* teach a new fact */
+            uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
             gui_chat_add("จำไว้แล้ว");
             gui_set_emotion(EMOTION_HAPPY);
         } else {
             int ki = kb_lookup(gInputBuf);                     /* answer from KB   */
-            if (ki >= 0) { gui_chat_add(g_kb[ki].a); gui_set_emotion(EMOTION_HAPPY); }
-            else         { gui_chat_add("ไม่ทราบ");    gui_set_emotion(EMOTION_CONFUSED); }
+            if (ki >= 0) {
+                uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
+                gui_chat_add(g_kb[ki].a);
+                gui_set_emotion(EMOTION_HAPPY);
+            } else {
+                /* KB miss: fall back to real model generation (captured into
+                 * gGenBuf, then routed into the chat log). */
+                gui_repaint_chat();   /* show "You: ..." + thinking face first */
+                gGenCapture = 1;
+                generate(&gTransformer, &gTokenizer, &gSampler, gInputBuf, GUI_GEN_STEPS);
+                gGenCapture = 0;
+                if (gGenLen > 0) {
+                    gui_chat_add(gGenBuf);
+                    gui_set_emotion(EMOTION_HAPPY);
+                } else {
+                    gui_chat_add("ไม่ทราบ");
+                    gui_set_emotion(EMOTION_CONFUSED);
+                }
+            }
         }
     }
 
