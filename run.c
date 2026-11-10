@@ -1688,6 +1688,10 @@ static EFI_STATUS init_gop(void) {
 /* EFI scan code for F1, used to toggle English <-> Thai input mode. */
 #define KBD_SCAN_F1 0x0B
 
+/* EFI scan codes for the UP / DOWN arrows, used for command-history recall. */
+#define KBD_SCAN_UP    0x01
+#define KBD_SCAN_DOWN  0x02
+
 /* 1 = Thai input mode (map US keys to Thai via Kedmanee), 0 = English. */
 static int gThaiMode = 0;
 
@@ -1802,6 +1806,88 @@ static void cursor_blink(void) {
     }
 }
 
+/* ----------------------------------------------------------------------------
+ * Command history (bash-style UP / DOWN recall)
+ * ------------------------------------------------------------------------- */
+
+#define MAX_HISTORY      10
+#define MAX_PROMPT_LEN   512   /* must match the caller's prompt buffer size */
+
+/* The last MAX_HISTORY prompts; gHistory[gHistoryCount-1] is the newest. */
+static char gHistory[MAX_HISTORY][MAX_PROMPT_LEN];
+static int  gHistoryCount = 0;   /* number of saved entries (0..MAX_HISTORY)  */
+static int  gHistoryIndex = -1;  /* -1 = not browsing; else index into gHistory */
+static char gDraft[MAX_PROMPT_LEN]; /* in-progress line, saved while browsing  */
+
+/* Erase the typed text currently on screen: paint the background over every
+ * cell from the prompt start up to the cursor.  Assumes the prompt is a single
+ * row (prompts long enough to wrap are not expected). */
+static void prompt_erase(int start_cx) {
+    int cy = (int)gCursorY;
+    for (int cx = start_cx; cx < (int)gCursorX; cx++)
+        hrf_draw_cp(' ', (UINT32)cx, (UINT32)cy, 0);   /* opaque blank -> erase */
+}
+
+/* Erase the on-screen text, reset the cursor to the prompt start, copy `text`
+ * into buf, and redraw it (advancing the cursor and setting *len). */
+static void redraw_prompt(const char *text, char *buf, int *len, int max_len,
+                          int start_cx, int start_cy) {
+    prompt_erase(start_cx);
+    gCursorX = (UINT32)start_cx;
+    gCursorY = (UINT32)start_cy;
+
+    UINTN n = strlen(text);
+    if (n > (UINTN)(max_len - 1)) n = (UINTN)(max_len - 1);
+    memcpy(buf, text, n);
+    buf[n] = '\0';
+    *len = (int)n;
+    fb_puts(buf);                       /* redraw (handles UTF-8 + Thai marks) */
+}
+
+/* UP: recall the previous (older) entry.  The first UP stashes the current
+ * line as the draft so DOWN can bring it back. */
+static void history_prev(char *buf, int *len, int max_len, int start_cx, int start_cy) {
+    if (gHistoryCount == 0) return;              /* nothing saved yet */
+
+    if (gHistoryIndex == -1) {
+        strcpy(gDraft, buf);                     /* save the line we were typing */
+        gHistoryIndex = gHistoryCount - 1;       /* most recent entry */
+    } else if (gHistoryIndex > 0) {
+        gHistoryIndex--;                         /* step to an older entry */
+    } else {
+        return;                                  /* already at the oldest */
+    }
+    redraw_prompt(gHistory[gHistoryIndex], buf, len, max_len, start_cx, start_cy);
+}
+
+/* DOWN: recall the next (newer) entry; past the newest, restore the draft and
+ * leave browsing mode. */
+static void history_next(char *buf, int *len, int max_len, int start_cx, int start_cy) {
+    if (gHistoryIndex == -1) return;             /* not browsing */
+
+    if (gHistoryIndex < gHistoryCount - 1) {
+        gHistoryIndex++;                         /* newer entry */
+        redraw_prompt(gHistory[gHistoryIndex], buf, len, max_len, start_cx, start_cy);
+    } else {
+        gHistoryIndex = -1;                      /* back at newest -> restore draft */
+        redraw_prompt(gDraft, buf, len, max_len, start_cx, start_cy);
+    }
+}
+
+/* Save a completed (non-empty) line, keeping only the newest MAX_HISTORY. */
+static void history_push(const char *s) {
+    if (s == NULL || s[0] == '\0') return;
+
+    if (gHistoryCount < MAX_HISTORY) {
+        strcpy(gHistory[gHistoryCount++], s);
+    } else {
+        for (int i = 1; i < MAX_HISTORY; i++)   /* drop oldest, shift left */
+            strcpy(gHistory[i - 1], gHistory[i]);
+        strcpy(gHistory[MAX_HISTORY - 1], s);
+    }
+    gHistoryIndex = -1;   /* submitting ends any browsing session */
+}
+
 /* Read one line of text from the UEFI console into buf (max `max_len` bytes
  * including the NUL).  Echoes printable characters, handles Backspace, toggles
  * Thai input with F1, and returns when the user presses Enter.  Arrows, and
@@ -1810,6 +1896,12 @@ static void cursor_blink(void) {
 static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
     int len = 0;
     buf[0] = '\0';
+    gHistoryIndex = -1;   /* start every line outside of history browsing */
+
+    /* remember where the editable prompt begins, so history recall can erase
+     * and redraw just the typed text (leaving the "AI prompt ... : " prefix). */
+    int start_cx = (int)gCursorX;
+    int start_cy = (int)gCursorY;
 
     cursor_show();   /* solid cursor at the position the prompt left us at */
 
@@ -1840,15 +1932,29 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
             continue;
         }
 
+        /* UP / DOWN arrow: recall the previous / next prompt from history. */
+        if (key.ScanCode == KBD_SCAN_UP) {
+            history_prev(buf, &len, max_len, start_cx, start_cy);
+            cursor_show();
+            continue;
+        }
+        if (key.ScanCode == KBD_SCAN_DOWN) {
+            history_next(buf, &len, max_len, start_cx, start_cy);
+            cursor_show();
+            continue;
+        }
+
         CHAR16 ch = key.UnicodeChar;
 
         if (ch == CHAR_CARRIAGE_RETURN) {
             fb_putc('\n');
+            if (len > 0) history_push(buf);   /* save non-empty line to history */
             break;                          /* Enter: cursor stays hidden */
         }
 
         if (ch == CHAR_BACKSPACE) {
             if (len > 0) {
+                gHistoryIndex = -1;         /* editing leaves history browsing */
                 /* Remove one full UTF-8 character: a Thai char is a 3-byte
                  * sequence, so keep dropping leading continuation bytes too. */
                 len--;
@@ -1864,7 +1970,7 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
         }
 
         if (key.ScanCode != 0) {
-            cursor_show();                  /* arrows / other F-keys / Delete / Esc */
+            cursor_show();                  /* other F-keys / Delete / Esc / Home / End */
             continue;
         }
 
@@ -1873,6 +1979,8 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
             cursor_show();
             continue;
         }
+
+        gHistoryIndex = -1;                 /* typing leaves history browsing */
 
         if (gThaiMode) {
             UINT32 cp = gKedmanee[(unsigned char)ch];
