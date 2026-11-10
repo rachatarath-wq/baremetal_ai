@@ -2325,7 +2325,11 @@ typedef struct { int x, y, w, h; } GuiRect;
 
 /* --- global state ---------------------------------------------------------- */
 
-static EFI_SIMPLE_POINTER_PROTOCOL *gMouse = NULL;
+static EFI_SIMPLE_POINTER_PROTOCOL   *gMouse    = NULL;
+static EFI_ABSOLUTE_POINTER_PROTOCOL *gAbsMouse = NULL;
+
+/* 1 = a usable pointer (absolute tablet preferred, else relative mouse) exists */
+static int mouse_available(void) { return gMouse != NULL || gAbsMouse != NULL; }
 
 static int    gMouseX = 0, gMouseY = 0;           /* cursor top-left, absolute px */
 static UINT32 gMouseSave[MOUSE_CURSOR_W * MOUSE_CURSOR_H]; /* pixels under cursor */
@@ -2349,13 +2353,25 @@ static int  gChatLines = 0;
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
 /* ----------------------------------------------------------------------------
- * 1. Mouse protocol: locate EFI_SIMPLE_POINTER_PROTOCOL and reset it.
+ * 1. Mouse protocol: prefer EFI_ABSOLUTE_POINTER_PROTOCOL (tablet), fall back
+ *    to EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), and reset whichever wins.
  * ------------------------------------------------------------------------- */
 
 static EFI_STATUS init_mouse(void) {
+    /* Absolute tablet first: QEMU's usb-tablet exposes this protocol, and its
+     * absolute coordinates map directly onto the screen (no accumulation). */
     EFI_STATUS st = uefi_call_wrapper(BS->LocateProtocol, 3,
-                                      &SimplePointerProtocol, NULL,
-                                      (VOID **)&gMouse);
+                                      &AbsolutePointerProtocol, NULL,
+                                      (VOID **)&gAbsMouse);
+    if (!EFI_ERROR(st) && gAbsMouse != NULL) {
+        uefi_call_wrapper(gAbsMouse->Reset, 2, gAbsMouse, FALSE);
+        return EFI_SUCCESS;
+    }
+    gAbsMouse = NULL;
+
+    st = uefi_call_wrapper(BS->LocateProtocol, 3,
+                           &SimplePointerProtocol, NULL,
+                           (VOID **)&gMouse);
     if (EFI_ERROR(st) || gMouse == NULL) {
         gMouse = NULL;
         return EFI_UNSUPPORTED;
@@ -2654,7 +2670,7 @@ static void gui_draw_desktop(void) {
 /* Redraw helpers wrap the cursor save/restore so any repaint that could sit
  * under the pointer does not erase it (or leave a stale save buffer). */
 static void gui_refresh_cursor(void) {
-    if (gMouse == NULL) return;      /* keyboard-only machine: no pointer */
+    if (!mouse_available()) return;  /* keyboard-only machine: no pointer */
     mouse_save();
     mouse_draw();
 }
@@ -2881,6 +2897,35 @@ static void gui_handle_key(EFI_INPUT_KEY key) {
 }
 
 static void gui_poll_mouse(void) {
+    if (gAbsMouse != NULL) {
+        /* Absolute tablet: map CurrentX/Y from [AbsoluteMin, AbsoluteMax] onto
+         * the framebuffer, then reuse the same move/click path as the mouse. */
+        EFI_ABSOLUTE_POINTER_STATE st;
+        EFI_STATUS s = uefi_call_wrapper(gAbsMouse->GetState, 2, gAbsMouse, &st);
+        if (s == EFI_NOT_READY || EFI_ERROR(s)) return;
+
+        UINT64 minx = 0, maxx = 0x7FFF, miny = 0, maxy = 0x7FFF;
+        if (gAbsMouse->Mode != NULL) {
+            minx = gAbsMouse->Mode->AbsoluteMinX;
+            maxx = gAbsMouse->Mode->AbsoluteMaxX;
+            miny = gAbsMouse->Mode->AbsoluteMinY;
+            maxy = gAbsMouse->Mode->AbsoluteMaxY;
+        }
+        UINT64 spanx = maxx > minx ? (maxx - minx) : 1;
+        UINT64 spany = maxy > miny ? (maxy - miny) : 1;
+        UINT64 cx = st.CurrentX >= minx ? (st.CurrentX - minx) : 0;
+        UINT64 cy = st.CurrentY >= miny ? (st.CurrentY - miny) : 0;
+        int nx = (int)(cx * (UINT64)(gFbWidth  - 1) / spanx);
+        int ny = (int)(cy * (UINT64)(gFbHeight - 1) / spany);
+        mouse_move_to(nx, ny);
+
+        int left = (st.ActiveButtons & EFI_ABSP_TouchActive) != 0;
+        if (left && !gMouseLeftWasDown)      /* rising edge = a fresh click */
+            gui_click(mouse_hot_x(), mouse_hot_y());
+        gMouseLeftWasDown = left;
+        return;
+    }
+
     if (gMouse == NULL) return;
 
     EFI_SIMPLE_POINTER_STATE st;
@@ -2902,12 +2947,12 @@ static void gui_init(void) {
     gui_init_colors();
     gui_layout();
     init_mouse();
-    if (gMouse != NULL) {           /* position the pointer at screen centre   */
+    if (mouse_available()) {        /* position the pointer at screen centre   */
         gMouseX = (int)gFbWidth / 2;
         gMouseY = (int)gFbHeight / 2;
     }
     gui_draw_desktop();             /* status bar shows the initial coordinates */
-    if (gMouse != NULL) {
+    if (mouse_available()) {
         mouse_save();
         mouse_draw();
     }
