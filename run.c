@@ -1892,8 +1892,12 @@ static void history_push(const char *s) {
  * including the NUL).  Echoes printable characters, handles Backspace, toggles
  * Thai input with F1, and returns when the user presses Enter.  Arrows, and
  * other F-keys / Delete / Esc are ignored.  A solid block cursor blinks at the
- * insertion point while idle.  Returns the number of bytes stored. */
-static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
+ * insertion point while idle.  Returns the number of bytes stored.
+ *
+ * NOTE: the GUI event loop uses gui_handle_key() instead.  This (and the cursor
+ * / command-history helpers below it) are kept for a possible text-mode fallback,
+ * so the function is marked unused rather than deleted. */
+static int __attribute__((unused)) read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
     int len = 0;
     buf[0] = '\0';
     gHistoryIndex = -1;   /* start every line outside of history browsing */
@@ -2296,6 +2300,640 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 }
 
 /* ----------------------------------------------------------------------------
+ * GUI layer: desktop + chat window + mouse pointer + clickable buttons
+ *
+ * Everything below draws straight into the GOP framebuffer (no window manager,
+ * no OS).  Text reuses the same HRFONT renderer as the console; the mouse
+ * pointer is a software cursor backed by a save/restore buffer so it never
+ * leaves a trail.  The whole UI runs in one non-blocking event loop below.
+ * ------------------------------------------------------------------------- */
+
+#define MOUSE_CURSOR_W     16
+#define MOUSE_CURSOR_H     16
+#define MOUSE_SENSITIVITY  2     /* divide relative mickeys by this (tunable)  */
+
+#define GUI_PAD            24    /* inner padding for window contents, px      */
+#define GUI_POLL_US        10000 /* 10 ms idle yield between input polls       */
+#define GUI_INPUT_LEN      512   /* editable input buffer, bytes               */
+#define GUI_CHAT_MAX_LINES 48
+#define GUI_CHAT_LINE_LEN  300   /* bytes: room for 80 three-byte Thai chars   */
+#define GUI_CHAT_CHARS     80    /* characters per wrapped chat line           */
+#define GUI_STATUS_H       40    /* top status bar height, px                  */
+#define CARET_W            3     /* input caret (text cursor) width, px        */
+
+typedef struct { int x, y, w, h; } GuiRect;
+
+/* --- global state ---------------------------------------------------------- */
+
+static EFI_SIMPLE_POINTER_PROTOCOL *gMouse = NULL;
+
+static int    gMouseX = 0, gMouseY = 0;           /* cursor top-left, absolute px */
+static UINT32 gMouseSave[MOUSE_CURSOR_W * MOUSE_CURSOR_H]; /* pixels under cursor */
+static int    gMouseSaved = 0;                    /* 1 = save buffer is valid     */
+static int    gMouseLeftWasDown = 0;              /* click rising-edge detection   */
+
+static UINT32 gColDesktop, gColChatBg, gColBorder, gColInputBg;
+static UINT32 gColButtonBg, gColButtonFg, gColText, gColAccent, gColMouse;
+
+static GuiRect gChatBox, gInputBox, gSendButton, gStatusBar;
+
+static char gInputBuf[GUI_INPUT_LEN];
+static int  gInputLen = 0;
+
+static int    gCaretVisible = 1;     /* input caret on/off (blinks while idle) */
+static UINT32 gCaretAccumUs = 0;      /* caret blink accumulator, microseconds  */
+
+static char gChatLog[GUI_CHAT_MAX_LINES][GUI_CHAT_LINE_LEN];
+static int  gChatLines = 0;
+
+static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
+
+/* ----------------------------------------------------------------------------
+ * 1. Mouse protocol: locate EFI_SIMPLE_POINTER_PROTOCOL and reset it.
+ * ------------------------------------------------------------------------- */
+
+static EFI_STATUS init_mouse(void) {
+    EFI_STATUS st = uefi_call_wrapper(BS->LocateProtocol, 3,
+                                      &SimplePointerProtocol, NULL,
+                                      (VOID **)&gMouse);
+    if (EFI_ERROR(st) || gMouse == NULL) {
+        gMouse = NULL;
+        return EFI_UNSUPPORTED;
+    }
+    /* Best-effort reset: zeroes the relative origin.  A machine with no mouse
+     * reports an error here but GetState() may still work, so ignore it. */
+    uefi_call_wrapper(gMouse->Reset, 2, gMouse, FALSE);
+    return EFI_SUCCESS;
+}
+
+/* ----------------------------------------------------------------------------
+ * 2. Software mouse cursor (ghosting prevention via save / draw / restore).
+ * ------------------------------------------------------------------------- */
+
+static UINT32 fb_get_pixel(int x, int y) {
+    if (gFbBase == NULL || x < 0 || y < 0) return 0;
+    if ((UINT32)x >= gFbWidth || (UINT32)y >= gFbHeight) return 0;
+    return *(UINT32 *)(gFbBase + (UINTN)y * gFbScanLine * 4 + (UINTN)x * 4);
+}
+
+/* (a) Save the background under the cursor bounding box before drawing. */
+static void mouse_save(void) {
+    for (int r = 0; r < MOUSE_CURSOR_H; r++)
+        for (int c = 0; c < MOUSE_CURSOR_W; c++)
+            gMouseSave[r * MOUSE_CURSOR_W + c] = fb_get_pixel(gMouseX + c, gMouseY + r);
+    gMouseSaved = 1;
+}
+
+/* (c) Restore the saved background when the cursor moves to a new position. */
+static void mouse_restore(void) {
+    if (!gMouseSaved) return;
+    for (int r = 0; r < MOUSE_CURSOR_H; r++)
+        for (int c = 0; c < MOUSE_CURSOR_W; c++)
+            DrawPixel((UINT32)(gMouseX + c), (UINT32)(gMouseY + r),
+                      gMouseSave[r * MOUSE_CURSOR_W + c]);
+    gMouseSaved = 0;
+}
+
+/* Crosshair shape: a 2px '+' spanning the whole cell (1 = paint this pixel).
+ * An arrow glyph could be swapped in here with a per-pixel bitmap the same way. */
+static int mouse_cursor_pixel(int c, int r) {
+    return (r == 7 || r == 8 || c == 7 || c == 8);
+}
+
+/* (b) Draw the pointer at the current position (call after mouse_save()). */
+static void mouse_draw(void) {
+    for (int r = 0; r < MOUSE_CURSOR_H; r++)
+        for (int c = 0; c < MOUSE_CURSOR_W; c++)
+            if (mouse_cursor_pixel(c, r))
+                DrawPixel((UINT32)(gMouseX + c), (UINT32)(gMouseY + r), gColMouse);
+}
+
+/* The hot-spot (the point a click refers to) is the centre of the crosshair. */
+static int mouse_hot_x(void) { return gMouseX + MOUSE_CURSOR_W / 2; }
+static int mouse_hot_y(void) { return gMouseY + MOUSE_CURSOR_H / 2; }
+
+/* Move the cursor to (nx, ny), clamped so the whole cursor stays on screen.
+ * Erases the old cursor, saves the background at the new spot, then redraws. */
+static void gui_draw_status(void);   /* forward decl: live coordinate readout */
+static void mouse_move_to(int nx, int ny) {
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    if (nx > (int)gFbWidth  - MOUSE_CURSOR_W) nx = (int)gFbWidth  - MOUSE_CURSOR_W;
+    if (ny > (int)gFbHeight - MOUSE_CURSOR_H) ny = (int)gFbHeight - MOUSE_CURSOR_H;
+    if (nx == gMouseX && ny == gMouseY) return;
+
+    mouse_restore();            /* erase the old cursor, leaving no trail       */
+    gMouseX = nx;
+    gMouseY = ny;
+    gui_draw_status();          /* refresh the coordinate readout (cursor hidden) */
+    mouse_save();               /* remember what is under the new position      */
+    mouse_draw();               /* paint the pointer on top                     */
+}
+
+/* ----------------------------------------------------------------------------
+ * 3a. UI rendering engine: colours + rectangle primitives + text.
+ * ------------------------------------------------------------------------- */
+
+static void gui_init_colors(void) {
+    gColDesktop  = fb_make_color(0x18, 0x22, 0x30);   /* dark slate blue        */
+    gColChatBg   = fb_make_color(0x10, 0x14, 0x1A);   /* chat window interior   */
+    gColBorder   = fb_make_color(0x3A, 0x4A, 0x60);   /* window borders         */
+    gColInputBg  = fb_make_color(0x0C, 0x10, 0x16);   /* input box interior     */
+    gColButtonBg = fb_make_color(0x2E, 0x8B, 0x57);   /* Send button (green)    */
+    gColButtonFg = fb_make_color(0xFF, 0xFF, 0xFF);
+    gColText     = fb_make_color(0xE6, 0xE6, 0xE6);
+    gColAccent   = fb_make_color(0x6F, 0xC3, 0xDF);   /* mode chip / highlights */
+    gColMouse    = fb_make_color(0xFF, 0xFF, 0xFF);
+}
+
+static void draw_rect(int x, int y, int w, int h, UINT32 color) {
+    fb_fill((UINT32)x, (UINT32)y, (UINT32)w, 1, color);            /* top    */
+    fb_fill((UINT32)x, (UINT32)(y + h - 1), (UINT32)w, 1, color);  /* bottom */
+    fb_fill((UINT32)x, (UINT32)y, 1, (UINT32)h, color);            /* left   */
+    fb_fill((UINT32)(x + w - 1), (UINT32)y, 1, (UINT32)h, color);  /* right  */
+}
+
+static void draw_filled_rect(int x, int y, int w, int h, UINT32 color) {
+    fb_fill((UINT32)x, (UINT32)y, (UINT32)w, (UINT32)h, color);
+}
+
+/* Draw a UTF-8 string at pixel (px, py) with explicit fg/bg colours.  The
+ * HRFONT renderer paints opaque cells using the global gBgColor, so it is
+ * swapped around the call and restored afterwards. */
+static void gui_text(int px, int py, const char *s, UINT32 fg, UINT32 bg) {
+    UINT32 save_bg = gBgColor;
+    gBgColor = bg;
+    int cx = px, cy = py;
+    hrf_puts(s, &cx, &cy, fg);
+    gBgColor = save_bg;
+}
+
+/* Decimal string for a non-negative int, into a caller-provided buffer. */
+static char *gui_itoa(int v, char *buf) {
+    char tmp[12];
+    int i = 0;
+    do { tmp[i++] = (char)('0' + (v % 10)); v /= 10; } while (v > 0);
+    int j = 0;
+    while (i > 0) buf[j++] = tmp[--i];
+    buf[j] = '\0';
+    return buf;
+}
+
+/* Top status bar: shows the live pointer hot-spot coordinates, so the user can
+ * always read exactly where the cursor is (ระบบบอกตำแหน่ง cursor). */
+static void gui_draw_status(void) {
+    draw_filled_rect(gStatusBar.x, gStatusBar.y, gStatusBar.w, gStatusBar.h,
+                     gColInputBg);
+    draw_rect(gStatusBar.x, gStatusBar.y, gStatusBar.w, gStatusBar.h, gColBorder);
+
+    char buf[80];
+    int n = 0;
+    const char *p;
+    for (p = "Mouse: X="; *p; p++) buf[n++] = *p;
+    gui_itoa(mouse_hot_x(), buf + n); while (buf[n]) n++;
+    for (p = "  Y="; *p; p++) buf[n++] = *p;
+    gui_itoa(mouse_hot_y(), buf + n); while (buf[n]) n++;
+    buf[n] = '\0';
+
+    gui_text(gStatusBar.x + GUI_PAD, gStatusBar.y + (GUI_STATUS_H - HRFONT_H) / 2,
+             buf, gColText, gColInputBg);
+}
+
+/* ----------------------------------------------------------------------------
+ * 3b. Layout, then the chat log, input box and Send button.
+ * ------------------------------------------------------------------------- */
+
+static void gui_layout(void) {
+    int W = (int)gFbWidth, H = (int)gFbHeight;
+    int m = 48;          /* outer margin */
+    int ih = 112;        /* input box height */
+    int gap = 40;        /* gap between chat window and input row */
+    int btn_w = 336;     /* Send button width */
+    int in_gap = 16;     /* gap between input box and Send button */
+
+    gStatusBar.x = 0;
+    gStatusBar.y = 0;
+    gStatusBar.w = W;
+    gStatusBar.h = GUI_STATUS_H;   /* top strip: live mouse-coordinate readout */
+
+    gChatBox.x = m;
+    gChatBox.y = m;
+    gChatBox.w = W - 2 * m;
+    gChatBox.h = H - 2 * m - ih - gap;
+
+    gInputBox.x = m;
+    gInputBox.y = H - m - ih;
+    gInputBox.w = W - 2 * m - btn_w - in_gap;
+    gInputBox.h = ih;
+
+    gSendButton.x = W - m - btn_w;
+    gSendButton.y = H - m - ih;
+    gSendButton.w = btn_w;
+    gSendButton.h = ih;
+}
+
+/* Bounded append of `line` into the chat log, scrolling when full. */
+static void gui_chat_append(const char *line) {
+    int dst = (gChatLines < GUI_CHAT_MAX_LINES) ? gChatLines : (GUI_CHAT_MAX_LINES - 1);
+
+    if (gChatLines >= GUI_CHAT_MAX_LINES) {
+        for (int i = 1; i < GUI_CHAT_MAX_LINES; i++)
+            memcpy(gChatLog[i - 1], gChatLog[i], GUI_CHAT_LINE_LEN); /* drop oldest */
+    }
+
+    int n = 0;
+    while (line[n] && n < GUI_CHAT_LINE_LEN - 1) { gChatLog[dst][n] = line[n]; n++; }
+    gChatLog[dst][n] = '\0';
+
+    if (gChatLines < GUI_CHAT_MAX_LINES) gChatLines++;
+}
+
+/* Append `text` to the chat, wrapping into GUI_CHAT_CHARS-character lines on
+ * UTF-8 boundaries (never splits a multi-byte Thai character). */
+static void gui_chat_add(const char *text) {
+    const char *p = text;
+    while (*p) {
+        const char *seg = p;
+        int chars = 0;
+        while (*p && chars < GUI_CHAT_CHARS) {
+            unsigned char b = (unsigned char)*p;
+            int extra = 0;
+            if      ((b & 0xE0) == 0xC0) extra = 1;
+            else if ((b & 0xF0) == 0xE0) extra = 2;
+            else if ((b & 0xF8) == 0xF0) extra = 3;
+            p++;
+            for (int i = 0; i < extra && *p && ((unsigned char)*p & 0xC0) == 0x80; i++)
+                p++;
+            chars++;
+        }
+        char line[GUI_CHAT_LINE_LEN];
+        int n = 0;
+        for (const char *q = seg; q < p && n < GUI_CHAT_LINE_LEN - 1; q++)
+            line[n++] = *q;
+        line[n] = '\0';
+        gui_chat_append(line);
+    }
+}
+
+/* Two-part append "a" then "b" (used for the "You: <prompt>" prefix). */
+static void gui_chat_add2(const char *a, const char *b) {
+    char tmp[GUI_INPUT_LEN + 8];
+    int n = 0;
+    for (const char *p = a; *p && n < (int)sizeof(tmp) - 1; p++) tmp[n++] = *p;
+    for (const char *p = b; *p && n < (int)sizeof(tmp) - 1; p++) tmp[n++] = *p;
+    tmp[n] = '\0';
+    gui_chat_add(tmp);
+}
+
+static void gui_draw_send_button(void) {
+    draw_filled_rect(gSendButton.x, gSendButton.y, gSendButton.w, gSendButton.h,
+                     gColButtonBg);
+    draw_rect(gSendButton.x, gSendButton.y, gSendButton.w, gSendButton.h,
+              gColBorder);
+    const char *label = "Send";
+    int tw = (int)strlen(label) * HRFONT_W;
+    int tx = gSendButton.x + (gSendButton.w - tw) / 2;
+    int ty = gSendButton.y + (gSendButton.h - HRFONT_H) / 2;
+    gui_text(tx, ty, label, gColButtonFg, gColButtonBg);
+}
+
+/* Column the input caret sits in: count spacing glyphs in gInputBuf so that
+ * Thai combining marks (zero-width) do not shift the caret. */
+static int gui_input_cells(void) {
+    const char *p = gInputBuf;
+    int cells = 0;
+    while (*p) {
+        UINT32 cp = hrf_decode_utf8(&p);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv != 0) cells++;
+    }
+    return cells;
+}
+
+/* Pixel x of the text caret, just past the last typed character. */
+static int gui_caret_x(void) {
+    return gInputBox.x + GUI_PAD + 3 * HRFONT_W + gui_input_cells() * HRFONT_W;
+}
+
+static void gui_draw_input(void) {
+    draw_filled_rect(gInputBox.x, gInputBox.y, gInputBox.w, gInputBox.h, gColInputBg);
+    draw_rect(gInputBox.x, gInputBox.y, gInputBox.w, gInputBox.h, gColBorder);
+    int ty = gInputBox.y + (gInputBox.h - HRFONT_H) / 2;
+    /* language-mode chip, then the text being typed */
+    gui_text(gInputBox.x + GUI_PAD, ty, gThaiMode ? "TH" : "EN", gColAccent, gColInputBg);
+    gui_text(gInputBox.x + GUI_PAD + 3 * HRFONT_W, ty, gInputBuf, gColText, gColInputBg);
+    /* blinking text cursor so the insertion point is always visible */
+    if (gCaretVisible) {
+        int cx = gui_caret_x();
+        if (cx + CARET_W <= gInputBox.x + gInputBox.w - 4)
+            draw_filled_rect(cx, ty, CARET_W, HRFONT_H, gColText);
+    }
+}
+
+static void gui_draw_chat(void) {
+    draw_filled_rect(gChatBox.x, gChatBox.y, gChatBox.w, gChatBox.h, gColChatBg);
+    int lx = gChatBox.x + GUI_PAD;
+    int ly = gChatBox.y + GUI_PAD;
+    for (int i = 0; i < gChatLines; i++) {
+        int y = ly + i * HRFONT_H;
+        if (y + HRFONT_H > gChatBox.y + gChatBox.h) break;   /* off the bottom */
+        gui_text(lx, y, gChatLog[i], gColText, gColChatBg);
+    }
+    draw_rect(gChatBox.x, gChatBox.y, gChatBox.w, gChatBox.h, gColBorder);
+}
+
+/* 3c. draw_desktop(): background + chat window + input box + Send button. */
+static void gui_draw_desktop(void) {
+    fb_fill(0, 0, gFbWidth, gFbHeight, gColDesktop);
+    gui_draw_status();
+    gui_draw_chat();
+    gui_draw_input();
+    gui_draw_send_button();
+}
+
+/* Redraw helpers wrap the cursor save/restore so any repaint that could sit
+ * under the pointer does not erase it (or leave a stale save buffer). */
+static void gui_refresh_cursor(void) {
+    if (gMouse == NULL) return;      /* keyboard-only machine: no pointer */
+    mouse_save();
+    mouse_draw();
+}
+
+static void gui_repaint_input(void) {
+    mouse_restore();
+    gui_draw_input();
+    gui_refresh_cursor();
+}
+
+static void gui_repaint_chat(void) {
+    mouse_restore();
+    gui_draw_chat();
+    gui_draw_input();
+    gui_refresh_cursor();
+}
+
+/* ----------------------------------------------------------------------------
+ * Input caret blinking + UP/DOWN command history (GUI input box).
+ * ------------------------------------------------------------------------- */
+
+static void gui_caret_reset(void) { gCaretVisible = 1; gCaretAccumUs = 0; }
+
+/* Toggle the input caret every CURSOR_BLINK_MS while idle. */
+static void gui_caret_blink(void) {
+    gCaretAccumUs += GUI_POLL_US;
+    if (gCaretAccumUs >= (UINT32)(CURSOR_BLINK_MS * 1000)) {
+        gCaretAccumUs = 0;
+        gCaretVisible = !gCaretVisible;
+        gui_repaint_input();   /* repaint to turn the caret bar on/off */
+    }
+}
+
+/* Recall older prompts into the input box (UP arrow). */
+static void gui_history_prev(void) {
+    if (gHistoryCount == 0) return;
+    if (gHistoryIndex == -1) {
+        strcpy(gDraft, gInputBuf);              /* save the in-progress line */
+        gHistoryIndex = gHistoryCount - 1;      /* newest entry */
+    } else if (gHistoryIndex > 0) {
+        gHistoryIndex--;                        /* step to an older entry */
+    } else {
+        return;                                 /* already at the oldest */
+    }
+    strcpy(gInputBuf, gHistory[gHistoryIndex]);
+    gInputLen = (int)strlen(gInputBuf);
+}
+
+/* Recall newer prompts / restore the draft line (DOWN arrow). */
+static void gui_history_next(void) {
+    if (gHistoryIndex == -1) return;            /* not browsing */
+    if (gHistoryIndex < gHistoryCount - 1) {
+        gHistoryIndex++;                        /* step to a newer entry */
+        strcpy(gInputBuf, gHistory[gHistoryIndex]);
+    } else {
+        gHistoryIndex = -1;                     /* back at newest -> restore draft */
+        strcpy(gInputBuf, gDraft);
+    }
+    gInputLen = (int)strlen(gInputBuf);
+}
+
+/* ----------------------------------------------------------------------------
+ * 4. Bounding-box click detection + the Send action.
+ * ------------------------------------------------------------------------- */
+
+static int is_clicked(int mx, int my, int bx, int by, int bw, int bh) {
+    return mx >= bx && mx < bx + bw && my >= by && my < by + bh;
+}
+
+/* ----------------------------------------------------------------------------
+ * Slash commands: '/'-prefixed input is intercepted before the KB / AI path.
+ * ------------------------------------------------------------------------- */
+
+static int gTrainingMode = 0;   /* placeholder state flag set by /train */
+
+/* Split "cmd [arg...]" in place.  *cmd is the command token (NUL-terminated at
+ * the first space); *arg is the remainder, or NULL when there is no argument. */
+static void slash_split(char *s, char **cmd, char **arg) {
+    *cmd = s;
+    char *p = s;
+    while (*p && *p != ' ') p++;   /* find the first space (or end) */
+    if (*p == ' ') {
+        *p = '\0';                 /* terminate the command token */
+        p++;
+        while (*p == ' ') p++;     /* skip spaces before the argument */
+        *arg = p;
+    } else {
+        *arg = NULL;
+    }
+}
+
+/* Placeholder: swap the active checkpoint.  A real implementation must tear down
+ * the current Transformer/Tokenizer, read `filename` off the boot volume and
+ * rebuild them (see read_file / build_transformer in efi_main). */
+static void load_new_model(const char *filename) {
+    gui_chat_add2("> loading model: ", filename);
+    gui_chat_add("> (load_new_model is a placeholder)");
+}
+
+static void process_slash_command(char *input) {
+    if (input[0] != '/') return;
+
+    char *cmd, *arg;
+    slash_split(input + 1, &cmd, &arg);   /* skip the leading '/' */
+
+    if (strcmp(cmd, "reboot") == 0) {
+        gui_chat_add("> rebooting...");
+        uefi_call_wrapper(RT->ResetSystem, 4, EfiResetCold, EFI_SUCCESS, 0, NULL);
+        gui_chat_add("> reboot failed (ResetSystem returned)");
+    } else if (strcmp(cmd, "shutdown") == 0) {
+        gui_chat_add("> powering off...");
+        uefi_call_wrapper(RT->ResetSystem, 4, EfiResetShutdown, EFI_SUCCESS, 0, NULL);
+        gui_chat_add("> shutdown failed (ResetSystem returned)");
+    } else if (strcmp(cmd, "clear") == 0) {
+        gChatLines = 0;               /* empty the log; gui_send repaints it */
+    } else if (strcmp(cmd, "help") == 0) {
+        gui_chat_add("> available commands:");
+        gui_chat_add(">   /reboot          cold reboot");
+        gui_chat_add(">   /shutdown        power off");
+        gui_chat_add(">   /clear           clear this chat");
+        gui_chat_add(">   /help            show this list");
+        gui_chat_add(">   /loadmodel FILE  load a model checkpoint");
+        gui_chat_add(">   /train           enter training mode");
+    } else if (strcmp(cmd, "loadmodel") == 0) {
+        if (arg && *arg) load_new_model(arg);
+        else             gui_chat_add("> usage: /loadmodel <filename>");
+    } else if (strcmp(cmd, "train") == 0) {
+        gTrainingMode = 1;
+        gui_chat_add("> training mode ON (placeholder)");
+    } else {
+        gui_chat_add2("> unknown command: /", cmd);
+    }
+}
+
+static void gui_send(void) {
+    if (gInputLen == 0) return;
+    gInputBuf[gInputLen] = '\0';
+
+    history_push(gInputBuf);   /* save for UP/DOWN recall (slash commands too) */
+
+    /* Slash commands are intercepted here, before the KB / AI path. */
+    if (gInputBuf[0] == '/') {
+        process_slash_command(gInputBuf);
+    } else {
+        gui_chat_add2("You: ", gInputBuf);
+
+        if (strncmp(gInputBuf, "จำไว้", strlen("จำไว้")) == 0) {
+            kb_remember(gRoot, gInputBuf + strlen("จำไว้"));   /* teach a new fact */
+            gui_chat_add("จำไว้แล้ว");
+        } else {
+            int ki = kb_lookup(gInputBuf);                     /* answer from KB   */
+            if (ki >= 0) gui_chat_add(g_kb[ki].a);
+            else         gui_chat_add("ไม่ทราบ");
+        }
+    }
+
+    gInputLen = 0;
+    gInputBuf[0] = '\0';
+    gui_repaint_chat();   /* also repaints the now-empty input box */
+}
+
+static void gui_click(int mx, int my) {
+    if (is_clicked(mx, my, gSendButton.x, gSendButton.y, gSendButton.w, gSendButton.h))
+        gui_send();
+}
+
+/* ----------------------------------------------------------------------------
+ * 5. Unified non-blocking event loop (keyboard + mouse + idle yield).
+ * ------------------------------------------------------------------------- */
+
+static void gui_handle_key(EFI_INPUT_KEY key) {
+    gui_caret_reset();   /* any key wakes the caret back to solid */
+
+    if (key.ScanCode == KBD_SCAN_F1) {
+        gThaiMode = !gThaiMode;
+        gui_repaint_input();
+        return;
+    }
+
+    if (key.ScanCode == KBD_SCAN_UP) {          /* recall older prompt */
+        gui_history_prev();
+        gui_repaint_input();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DOWN) {        /* recall newer prompt / draft */
+        gui_history_next();
+        gui_repaint_input();
+        return;
+    }
+
+    CHAR16 ch = key.UnicodeChar;
+
+    if (ch == CHAR_CARRIAGE_RETURN) { gui_send(); return; }
+
+    if (ch == CHAR_BACKSPACE) {
+        if (gInputLen > 0) {
+            gHistoryIndex = -1;                 /* editing leaves history browsing */
+            /* remove one full UTF-8 character (Thai chars are 3 bytes) */
+            gInputLen--;
+            gInputBuf[gInputLen] = '\0';
+            while (gInputLen > 0 && ((unsigned char)gInputBuf[gInputLen - 1] & 0xC0) == 0x80) {
+                gInputLen--;
+                gInputBuf[gInputLen] = '\0';
+            }
+            gui_repaint_input();
+        }
+        return;
+    }
+
+    if (key.ScanCode != 0) return;            /* other F-keys / Esc */
+    if (ch < 0x20 || ch >= 0x7f) return;      /* drop control characters      */
+
+    gHistoryIndex = -1;                       /* typing leaves history browsing */
+
+    if (gThaiMode) {
+        UINT32 cp = gKedmanee[(unsigned char)ch];
+        if (cp == 0) cp = (UINT32)ch;
+        append_utf8(gInputBuf, &gInputLen, GUI_INPUT_LEN, cp);
+    } else if (gInputLen < GUI_INPUT_LEN - 1) {
+        gInputBuf[gInputLen++] = (char)ch;
+        gInputBuf[gInputLen] = '\0';
+    }
+    gui_repaint_input();
+}
+
+static void gui_poll_mouse(void) {
+    if (gMouse == NULL) return;
+
+    EFI_SIMPLE_POINTER_STATE st;
+    EFI_STATUS s = uefi_call_wrapper(gMouse->GetState, 2, gMouse, &st);
+    if (s == EFI_NOT_READY || EFI_ERROR(s)) return;
+
+    int dx = (int)st.RelativeMovementX / MOUSE_SENSITIVITY;
+    int dy = (int)st.RelativeMovementY / MOUSE_SENSITIVITY;
+    if (dx != 0 || dy != 0)
+        mouse_move_to(gMouseX + dx, gMouseY + dy);
+
+    int left = (st.LeftButton != 0);
+    if (left && !gMouseLeftWasDown)      /* rising edge = a fresh click */
+        gui_click(mouse_hot_x(), mouse_hot_y());
+    gMouseLeftWasDown = left;
+}
+
+static void gui_init(void) {
+    gui_init_colors();
+    gui_layout();
+    init_mouse();
+    if (gMouse != NULL) {           /* position the pointer at screen centre   */
+        gMouseX = (int)gFbWidth / 2;
+        gMouseY = (int)gFbHeight / 2;
+    }
+    gui_draw_desktop();             /* status bar shows the initial coordinates */
+    if (gMouse != NULL) {
+        mouse_save();
+        mouse_draw();
+    }
+}
+
+static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
+    gRoot = root;
+    for (;;) {
+        /* 1. keyboard: non-blocking read; act only when a key is present */
+        EFI_INPUT_KEY key;
+        EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
+        if (ks == EFI_SUCCESS)
+            gui_handle_key(key);
+
+        /* 2. mouse: poll relative movement and button clicks */
+        gui_poll_mouse();
+
+        /* 3. blink the input caret while idle */
+        gui_caret_blink();
+
+        /* 4. idle yield so we do not spin the CPU at 100% */
+        uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+    }
+}
+
+/* ----------------------------------------------------------------------------
  * UEFI entry point
  * ------------------------------------------------------------------------- */
 
@@ -2323,7 +2961,6 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     // --- tune these for your hardware ---
     CHAR16 *checkpoint_name = L"\\stories15M_thai_q80.bin";
     CHAR16 *tokenizer_name  = L"\\tokenizer.bin";
-    char    prompt[512];               // filled in from the keyboard at runtime
     int     steps           = 256;      // number of tokens to generate
     float   temperature     = 1.0f;     // 0.0 = greedy
     float   topp            = 0.9f;     // nucleus sampling
@@ -2384,26 +3021,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     kb_load(root);
     fb_printf("\n"); // added new line befor ai prompt
 
-    // interactive loop: ask for a prompt, answer from KB / teach a new fact /
-    // admit "ไม่ทราบ", then repeat until the user presses Enter on an empty line
-    for (;;) {
-        fb_printf("AI prompt [%a] : ",
-                  gThaiMode ? "TH" : "EN");
-        read_line(SystemTable->ConIn, prompt, sizeof(prompt));
-        if (prompt[0] == '\0') break;
-
-        if (strncmp(prompt, "จำไว้", strlen("จำไว้")) == 0) {
-            kb_remember(root, prompt + strlen("จำไว้"));   // ชั้นที่ 3: สอนข้อใหม่
-        } else {
-            int ki = kb_lookup(prompt);                     // ชั้นที่ 1: ค้น KB
-            if (ki >= 0) {
-                fb_puts(g_kb[ki].a);
-                fb_putc('\n');
-            } else {
-                fb_puts("ไม่ทราบ\n");                       // ชั้นที่ 2: ซื่อสัตย์
-            }
-        }
-    }
+    // GUI: draw the desktop and run the unified keyboard + mouse event loop.
+    // The loop runs until the machine is reset (no text-mode exit anymore).
+    gui_init();
+    gui_run(SystemTable->ConIn, root);
 
     // memory and file handle cleanup
     free_sampler(&sampler);
