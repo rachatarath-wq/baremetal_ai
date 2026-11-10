@@ -64,11 +64,14 @@
 
 | ลำดับ | งาน | อยู่ตรงไหน | ยาก |
 |---|---|---|---|
-| 1 | **KB lookup บน bare-metal**: โหลด `qa_thai_all.txt` (หรือ `kb.tsv`) ขึ้น RAM ตอนบูต + match | `run.c` | กลาง |
+| 1 | **KB lookup บน bare-metal** ✅ เสร็จแล้ว: โหลด `kb.txt` (TSV `คำถาม<TAB>คำตอบ` จาก `tools/build_kb.py`) ขึ้น RAM ตอนบูต + match (exact → char n-gram Jaccard ≥0.6) | `run.c` (`kb_load`/`kb_lookup`) | กลาง |
 | 2 | **router + "ไม่ทราบ"**: ไม่ generate เมื่อไม่เจอ | `run.c` | ง่าย |
 | 3 | **โหมด "จำไว้:"**: รับคำสั่ง + append เขียนลง flash (vvfat ต้อง `rw`) | `run.c` | กลาง |
 | 4 | consolidate โหมด 2 เข้า `/auto-improve` (นับความถี่ข้อที่ถาม) | host | ง่าย |
 | 5 | (ข้ามได้) RAG ระยะไกล + network stack | `run.c` + host | ยาก |
+
+> ชั้นที่ 1 ตอนนี้: เจอใน KB → ตอบจาก `kb.txt` ตรง ๆ · ไม่เจอ → **ยัง generate ตามเดิม**
+> (ชั้นที่ 2 จะเปลี่ยน "ไม่เจอ" ให้ตอบ "ไม่ทราบ" แทน สำหรับโหมด Q&A ล้วน)
 
 ---
 

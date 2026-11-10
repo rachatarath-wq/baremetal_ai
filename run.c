@@ -1858,6 +1858,148 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 }
 
 /* ----------------------------------------------------------------------------
+ * Knowledge-base lookup (LEARNING_SYSTEM_PLAN.md, ชั้นที่ 1)
+ *
+ * The 15M model can only memorise facts it was trained on, so a brand-new
+ * question makes it hallucinate.  kb.txt — a UTF-8, tab-separated
+ * "question<TAB>answer" file at the boot volume root — holds the facts as data
+ * instead.  kb_lookup() matches a typed prompt against it (exact after
+ * whitespace normalisation, then character n-gram Jaccard), and efi_main()
+ * prints the stored answer directly when a match is found.
+ * ------------------------------------------------------------------------- */
+
+#define KB_MAX_ENTRIES 2048
+#define KB_MAX_Q       192    /* max normalised code points per question */
+
+typedef struct {
+    int     qn;               /* normalised code-point length */
+    UINT32  qcp[KB_MAX_Q];    /* normalised question code points */
+    char   *a;                /* answer (points into the kb.txt buffer) */
+} KBEntry;
+
+static KBEntry *g_kb = NULL;
+static int      g_kb_n = 0;
+static VOID    *g_kb_data = NULL;   /* kb.txt buffer, freed at exit */
+
+/* Decode UTF-8 into code points, skipping whitespace and '?'.  Returns the
+ * number of code points (truncated at `max`). */
+static int utf8_norm(const char *s, UINT32 *cp, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        unsigned char b = (unsigned char)*s;
+        UINT32 c;
+        int extra;
+        if (b < 0x80)              { c = b;       extra = 0; }
+        else if ((b & 0xE0) == 0xC0) { c = b & 0x1F; extra = 1; }
+        else if ((b & 0xF0) == 0xE0) { c = b & 0x0F; extra = 2; }
+        else if ((b & 0xF8) == 0xF0) { c = b & 0x07; extra = 3; }
+        else { s++; continue; }    /* invalid lead byte: skip */
+        s++;
+        for (int i = 0; i < extra && *s; i++) {
+            if (((unsigned char)*s & 0xC0) != 0x80) break;
+            c = (c << 6) | ((unsigned char)*s & 0x3F);
+            s++;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '?') continue;
+        cp[n++] = c;
+    }
+    return n;
+}
+
+/* Character n-gram (trigram, bigram fallback) Jaccard similarity in [0,1]. */
+static float ngram_jaccard(const UINT32 *a, int na, const UINT32 *b, int nb) {
+    int n = 3;
+    if (na < n || nb < n) n = 2;
+    if (na < n || nb < n) return 0.0f;
+    int ga = na - n + 1;
+    int gb = nb - n + 1;
+    if (ga <= 0 || gb <= 0) return 0.0f;
+    int inter = 0;
+    for (int i = 0; i < ga; i++) {
+        for (int j = 0; j < gb; j++) {
+            int k = 0;
+            while (k < n && a[i + k] == b[j + k]) k++;
+            if (k == n) { inter++; break; }
+        }
+    }
+    int uni = ga + gb - inter;
+    if (uni <= 0) return 0.0f;
+    return (float)inter / (float)uni;
+}
+
+/* Return the index of the best-matching KB entry for `prompt`, or -1. */
+static int kb_lookup(const char *prompt) {
+    if (g_kb_n == 0) return -1;
+    UINT32 pcp[KB_MAX_Q];
+    int pn = utf8_norm(prompt, pcp, KB_MAX_Q);
+    if (pn == 0) return -1;
+
+    int best = -1;
+    float best_score = 0.0f;
+    for (int i = 0; i < g_kb_n; i++) {
+        KBEntry *e = &g_kb[i];
+        if (pn == e->qn) {
+            int same = 1;
+            for (int k = 0; k < pn; k++) {
+                if (pcp[k] != e->qcp[k]) { same = 0; break; }
+            }
+            if (same) return i;   /* exact match always wins */
+        }
+        float s = ngram_jaccard(pcp, pn, e->qcp, e->qn);
+        if (s > best_score) { best_score = s; best = i; }
+    }
+    return (best_score >= 0.60f) ? best : -1;
+}
+
+/* Load kb.txt from the boot volume root into g_kb.  Returns the entry count,
+ * or -1 if the file is absent/empty (lookup then simply never matches). */
+static int kb_load(EFI_FILE_HANDLE root) {
+    VOID *data = NULL;
+    UINTN size = 0;
+    EFI_STATUS st = read_file(root, L"\\kb.txt", 0, &data, &size);
+    if (EFI_ERROR(st) || data == NULL) return -1;
+    if (size < 4) { FreePool(data); return -1; }
+
+    g_kb_data = data;
+    char *buf = (char *)data;
+    g_kb = (KBEntry *)AllocateZeroPool(KB_MAX_ENTRIES * sizeof(KBEntry));
+    if (g_kb == NULL) { return -1; }
+    g_kb_n = 0;
+
+    char *p = buf;
+    char *end = buf + size;
+    while (p < end && g_kb_n < KB_MAX_ENTRIES) {
+        char *tab = p;
+        while (tab < end && *tab != '\t' && *tab != '\n') tab++;
+        if (tab >= end || *tab != '\t') {
+            /* malformed line (no tab): skip to the next newline */
+            while (p < end && *p != '\n') p++;
+            if (p < end) p++;
+            continue;
+        }
+        *tab = '\0';                 /* NUL-terminate the question */
+        char *q = p;
+        char *a = tab + 1;
+        char *nl = a;
+        while (nl < end && *nl != '\n') nl++;
+        if (nl >= end) break;        /* last line lacks a newline (builder guarantees it) */
+        *nl = '\0';                  /* NUL-terminate the answer */
+        if (nl > a && nl[-1] == '\r') nl[-1] = '\0';   /* CRLF safety */
+
+        if (*q != '\0' && *a != '\0') {
+            KBEntry *e = &g_kb[g_kb_n];
+            e->a = a;
+            e->qn = utf8_norm(q, e->qcp, KB_MAX_Q);
+            if (e->qn > 0) g_kb_n++;
+        }
+        p = nl + 1;
+    }
+
+    fb_printf("kb: %d entries loaded (%lu bytes)\n", g_kb_n, (UINT64)size);
+    return g_kb_n;
+}
+
+/* ----------------------------------------------------------------------------
  * UEFI entry point
  * ------------------------------------------------------------------------- */
 
@@ -1938,6 +2080,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, seed);
 
+    // load the knowledge base; a matched fact is answered verbatim (no
+    // generation), so known questions stop being hallucinated
+    kb_load(root);
+
     // interactive loop: ask for a prompt, generate, then repeat until the
     // user presses Enter on an empty line to quit
     for (;;) {
@@ -1945,7 +2091,13 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
                   gThaiMode ? "TH" : "EN");
         read_line(SystemTable->ConIn, prompt, sizeof(prompt));
         if (prompt[0] == '\0') break;
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        int ki = kb_lookup(prompt);
+        if (ki >= 0) {
+            fb_puts(g_kb[ki].a);
+            fb_putc('\n');
+        } else {
+            generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        }
     }
 
     // memory and file handle cleanup
@@ -1954,6 +2106,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     free_transformer(&transformer);
     FreePool(tokenizer_data);
     // checkpoint_data is freed by free_transformer()
+    if (g_kb)        FreePool(g_kb);
+    if (g_kb_data)   FreePool(g_kb_data);
 
     return EFI_SUCCESS;
 }

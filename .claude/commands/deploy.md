@@ -16,3 +16,6 @@ argument-hint: "[model-name]"
    `CHAR16 *checkpoint_name = L"\\<model>";`
 3. `make && make install`
 4. เตือนผู้ใช้: ต้องวางไฟล์โมเดล + tokenizer.bin ไว้ที่ root ของ USB (FAT32) ด้วย
+5. ถ้าเปิดใช้งาน KB lookup (ชั้นที่ 1): รัน `tools/venv/bin/python tools/build_kb.py`
+   แล้ว copy `kb.txt` ไป root ของ USB ด้วย (ตัว `run.c` จะโหลด `\kb.txt` ตอนบูต;
+   ถ้าไม่มีไฟล์ ก็ข้าม lookup ไป generate ตามเดิม ไม่ crash)

@@ -29,6 +29,7 @@ __pycache__/
 /thai_corpus_clean.txt
 /thai_corpus_v2.txt
 /thai_qa.txt
+/kb.txt
 
 # Large binaries / backups / archives
 *.zip
