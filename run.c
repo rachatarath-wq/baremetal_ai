@@ -1734,27 +1734,109 @@ static void append_utf8(char *buf, int *len, int max_len, UINT32 cp) {
     }
 }
 
+/* ----------------------------------------------------------------------------
+ * Blinking text cursor
+ * ------------------------------------------------------------------------- */
+
+#define CURSOR_BLINK_MS     500    /* ON/OFF period while idle */
+#define CURSOR_POLL_US      10000  /* idle poll interval: 10ms -> 100 Hz */
+
+/* Cursor shape: solid block fills the cell, underscore draws a thick bar across
+ * the cell bottom. */
+#define CURSOR_STYLE_BLOCK       1
+#define CURSOR_STYLE_UNDERSCORE  2
+#define CURSOR_STYLE             CURSOR_STYLE_BLOCK
+#define CURSOR_UNDERSCORE_H      3     /* bar thickness, px (underscore style) */
+
+/* Blink state: is the cursor currently painted, and how many microseconds have
+ * been stalled since the last toggle (see cursor_blink below). */
+static int     gCursorVisible = 1;
+static UINT32  gBlinkAccumUs  = 0;
+
+/* Paint the cursor shape at pixel (x, y).  `color` is a framebuffer-native
+ * colour word (from fb_make_color()); UINT32 == uint32_t in gnu-efi. */
+void draw_cursor(int x, int y, uint32_t color) {
+    if (gFbBase == NULL) return;
+    if (x < 0 || y < 0)  return;
+#if CURSOR_STYLE == CURSOR_STYLE_BLOCK
+    fb_fill((UINT32)x, (UINT32)y, HRFONT_W, HRFONT_H, (UINT32)color);
+#else
+    fb_fill((UINT32)x, (UINT32)(y + HRFONT_H - CURSOR_UNDERSCORE_H),
+            HRFONT_W, CURSOR_UNDERSCORE_H, (UINT32)color);
+#endif
+}
+
+/* Restore the cell at pixel (x, y) to the background, erasing the cursor.
+ * font_width/font_height are the cell size in pixels (pass HRFONT_W/HRFONT_H). */
+void erase_cursor(int x, int y, uint32_t bg_color, int font_width, int font_height) {
+    if (gFbBase == NULL) return;
+    if (x < 0 || y < 0 || font_width <= 0 || font_height <= 0) return;
+    fb_fill((UINT32)x, (UINT32)y,
+            (UINT32)font_width, (UINT32)font_height, (UINT32)bg_color);
+}
+
+/* --- thin wrappers that use the global cell cursor -------------------------- */
+
+/* Erase the cursor at (gCursorX, gCursorY) and mark it hidden. */
+static void cursor_hide(void) {
+    erase_cursor((int)(gCursorX * HRFONT_W), (int)(gCursorY * HRFONT_H),
+                 gBgColor, HRFONT_W, HRFONT_H);
+    gCursorVisible = 0;
+}
+
+/* Draw a solid cursor at (gCursorX, gCursorY) and restart the blink timer. */
+static void cursor_show(void) {
+    draw_cursor((int)(gCursorX * HRFONT_W), (int)(gCursorY * HRFONT_H), gFgColor);
+    gCursorVisible = 1;
+    gBlinkAccumUs = 0;   /* solid, and the OFF phase starts fresh */
+}
+
+/* Advance the blink timer by one poll interval and toggle visibility when a
+ * full period has elapsed.  Call once per idle input-loop iteration. */
+static void cursor_blink(void) {
+    gBlinkAccumUs += CURSOR_POLL_US;
+    if (gBlinkAccumUs >= (UINT32)(CURSOR_BLINK_MS * 1000)) {
+        gBlinkAccumUs = 0;
+        if (gCursorVisible) cursor_hide();
+        else                cursor_show();
+    }
+}
+
 /* Read one line of text from the UEFI console into buf (max `max_len` bytes
  * including the NUL).  Echoes printable characters, handles Backspace, toggles
  * Thai input with F1, and returns when the user presses Enter.  Arrows, and
- * other F-keys / Delete / Esc are ignored.  Returns the number of bytes stored. */
+ * other F-keys / Delete / Esc are ignored.  A solid block cursor blinks at the
+ * insertion point while idle.  Returns the number of bytes stored. */
 static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
     int len = 0;
     buf[0] = '\0';
+
+    cursor_show();   /* solid cursor at the position the prompt left us at */
 
     for (;;) {
         EFI_INPUT_KEY key;
         EFI_STATUS status = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
 
         /* ReadKeyStroke is non-blocking: it returns EFI_NOT_READY while the
-         * input queue is empty, so spin until a key actually arrives. */
-        if (status == EFI_NOT_READY) continue;
+         * input queue is empty.  While idle we blink the cursor and yield for
+         * a short Stall instead of busy-spinning at 100% CPU. */
+        if (status == EFI_NOT_READY) {
+            cursor_blink();
+            uefi_call_wrapper(BS->Stall, 1, CURSOR_POLL_US);
+            continue;
+        }
         if (EFI_ERROR(status)) continue;
+
+        /* A key arrived: erase the cursor from its current cell so the edit
+         * below repaints cleanly.  Every non-Enter path re-draws it solid at
+         * the new position (cursor_show), resetting the blink phase. */
+        cursor_hide();
 
         /* F1 toggles English <-> Thai (Kedmanee) input mode. */
         if (key.ScanCode == KBD_SCAN_F1) {
             gThaiMode = !gThaiMode;
             fb_puts(gThaiMode ? "[TH]" : "[EN]");
+            cursor_show();
             continue;
         }
 
@@ -1762,7 +1844,7 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
 
         if (ch == CHAR_CARRIAGE_RETURN) {
             fb_putc('\n');
-            break;                          /* Enter */
+            break;                          /* Enter: cursor stays hidden */
         }
 
         if (ch == CHAR_BACKSPACE) {
@@ -1777,15 +1859,20 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
                 }
                 fb_putc('\b');              /* erase one glyph cell */
             }
+            cursor_show();
             continue;
         }
 
         if (key.ScanCode != 0) {
-            continue;                       /* arrows / other F-keys / Delete / Esc */
+            cursor_show();                  /* arrows / other F-keys / Delete / Esc */
+            continue;
         }
 
         /* printable characters only (drop control characters) */
-        if (ch < 0x20 || ch >= 0x7f) continue;
+        if (ch < 0x20 || ch >= 0x7f) {
+            cursor_show();
+            continue;
+        }
 
         if (gThaiMode) {
             UINT32 cp = gKedmanee[(unsigned char)ch];
@@ -1800,6 +1887,7 @@ static int read_line(SIMPLE_INPUT_INTERFACE *ConIn, char *buf, int max_len) {
                 fb_putc((char)ch);          /* echo */
             }
         }
+        cursor_show();
     }
 
     return len;
@@ -2117,9 +2205,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     }
 
     fb_printf("llama2.c bare-metal UEFI inference\n");
-    fb_puts("\n>> ระบบแสดงผลภาษาไทยพร้อมใช้งาน: สวัสดี Bare-Metal AI <<\n\n");
     fb_printf("framebuffer %u x %u (%lu bytes, scanline %u px)\n",
               gFbWidth, gFbHeight, gFbSize, gFbScanLine);
+
+    fb_puts("\n>> ระบบแสดงผลภาษาไทยพร้อมใช้งาน: สวัสดี Bare-Metal AI <<");
+    fb_puts("\n>> กด F1 สลับภาษาไทย / อังกฤษ  ออกโปรแกรมให้กด enter<<\n\n");
+    
 
     // --- tune these for your hardware ---
     CHAR16 *checkpoint_name = L"\\stories15M_thai_q80.bin";
@@ -2183,11 +2274,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     // load the knowledge base; a matched fact is answered verbatim (no
     // generation), so known questions stop being hallucinated
     kb_load(root);
+    fb_printf("\n"); // added new line befor ai prompt
 
     // interactive loop: ask for a prompt, answer from KB / teach a new fact /
     // admit "ไม่ทราบ", then repeat until the user presses Enter on an empty line
     for (;;) {
-        fb_printf("Enter prompt [%a] (F1 toggles EN/TH) (empty to quit): ",
+        fb_printf("AI prompt [%a] : ",
                   gThaiMode ? "TH" : "EN");
         read_line(SystemTable->ConIn, prompt, sizeof(prompt));
         if (prompt[0] == '\0') break;
