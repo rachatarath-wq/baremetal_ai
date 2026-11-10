@@ -45,6 +45,12 @@ static int strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+static int strncmp(const char *a, const char *b, UINTN n) {
+    while (n && *a && *a == *b) { a++; b++; n--; }
+    if (n == 0) return 0;
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
 static char *strcpy(char *dest, const char *src) {
     char *r = dest;
     while ((*dest++ = *src++) != '\0') ;
@@ -1999,6 +2005,100 @@ static int kb_load(EFI_FILE_HANDLE root) {
     return g_kb_n;
 }
 
+/* Append one UTF-8 line to kb.txt on the boot volume (EFI_FILE_PROTOCOL write).
+ * Returns 0 on success, -1 on failure (e.g. read-only volume). */
+static int kb_append_file(EFI_FILE_HANDLE root, const char *line) {
+    EFI_STATUS status;
+    EFI_FILE_HANDLE file = NULL;
+    EFI_FILE_INFO *info = NULL;
+    UINTN info_size = SIZE_OF_EFI_FILE_INFO + 256;
+    EFI_GUID fiGuid = EFI_FILE_INFO_ID;
+    UINT64 mode = EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE;
+
+    status = uefi_call_wrapper(root->Open, 5, root, &file, L"\\kb.txt", mode, 0);
+    if (EFI_ERROR(status)) return -1;
+
+    /* seek to end-of-file so the new line is appended, not overwriting */
+    info = AllocateZeroPool(info_size);
+    if (info != NULL) {
+        status = uefi_call_wrapper(file->GetInfo, 4, file, &fiGuid, &info_size, info);
+        if (!EFI_ERROR(status)) {
+            uefi_call_wrapper(file->SetPosition, 2, file, (UINT64)info->FileSize);
+        }
+        FreePool(info);
+    }
+
+    UINTN want = strlen(line);
+    UINTN len = want;
+    status = uefi_call_wrapper(file->Write, 3, file, &len, (VOID *)line);
+    int ok = (!EFI_ERROR(status) && len == want);
+    uefi_call_wrapper(file->Flush, 1, file);
+    uefi_call_wrapper(file->Close, 1, file);
+    return ok ? 0 : -1;
+}
+
+/* "จำไว้: คำถาม = คำตอบ" — teach a new fact on-device (LEARNING_SYSTEM_PLAN.md
+ * ชั้นที่ 3): append it to kb.txt on flash and add it to the in-memory KB so it
+ * is answerable immediately, without any retraining. */
+static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
+    /* skip leading spaces and an optional ':' */
+    while (*arg == ' ' || *arg == '\t' || *arg == ':') arg++;
+
+    char *eq = NULL;
+    for (char *p = arg; *p; p++) { if (*p == '=') { eq = p; break; } }
+    if (eq == NULL) {
+        fb_puts("รูปแบบ: จำไว้: คำถาม = คำตอบ\n");
+        return;
+    }
+    *eq = '\0';
+    char *q = arg;
+    char *a = eq + 1;
+
+    /* trim ASCII whitespace around both sides */
+    while (*a == ' ' || *a == '\t') a++;
+    char *qe = q + strlen(q);
+    while (qe > q && (qe[-1] == ' ' || qe[-1] == '\t')) { qe--; *qe = '\0'; }
+    char *ae = a + strlen(a);
+    while (ae > a && (ae[-1] == ' ' || ae[-1] == '\t')) { ae--; *ae = '\0'; }
+
+    if (*q == '\0' || *a == '\0') {
+        fb_puts("รูปแบบ: จำไว้: คำถาม = คำตอบ\n");
+        return;
+    }
+
+    /* build the "question<TAB>answer\n" line and append it to kb.txt */
+    char line[1024];
+    int li = 0;
+    for (char *p = q; *p && li < (int)sizeof(line) - 3; p++) line[li++] = *p;
+    line[li++] = '\t';
+    for (char *p = a; *p && li < (int)sizeof(line) - 3; p++) line[li++] = *p;
+    line[li++] = '\n';
+    line[li] = '\0';
+
+    if (kb_append_file(root, line) != 0) {
+        fb_puts("เขียนลง flash ไม่สำเร็จ (โวลุ่มอ่านอย่างเดียว?)\n");
+        return;
+    }
+
+    /* update the in-memory KB so the fact answers right now */
+    if (g_kb == NULL) {
+        g_kb = (KBEntry *)AllocateZeroPool(KB_MAX_ENTRIES * sizeof(KBEntry));
+    }
+    if (g_kb != NULL && g_kb_n < KB_MAX_ENTRIES) {
+        KBEntry *e = &g_kb[g_kb_n];
+        e->qn = utf8_norm(q, e->qcp, KB_MAX_Q);
+        char *copy = AllocatePool(strlen(a) + 1);
+        if (copy != NULL && e->qn > 0) {
+            strcpy(copy, a);
+            e->a = copy;
+            g_kb_n++;
+        }
+    }
+    fb_puts("จำไว้แล้ว: ");
+    fb_puts(a);
+    fb_putc('\n');
+}
+
 /* ----------------------------------------------------------------------------
  * UEFI entry point
  * ------------------------------------------------------------------------- */
@@ -2084,19 +2184,24 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     // generation), so known questions stop being hallucinated
     kb_load(root);
 
-    // interactive loop: ask for a prompt, generate, then repeat until the
-    // user presses Enter on an empty line to quit
+    // interactive loop: ask for a prompt, answer from KB / teach a new fact /
+    // admit "ไม่ทราบ", then repeat until the user presses Enter on an empty line
     for (;;) {
         fb_printf("Enter prompt [%a] (F1 toggles EN/TH) (empty to quit): ",
                   gThaiMode ? "TH" : "EN");
         read_line(SystemTable->ConIn, prompt, sizeof(prompt));
         if (prompt[0] == '\0') break;
-        int ki = kb_lookup(prompt);
-        if (ki >= 0) {
-            fb_puts(g_kb[ki].a);
-            fb_putc('\n');
+
+        if (strncmp(prompt, "จำไว้", strlen("จำไว้")) == 0) {
+            kb_remember(root, prompt + strlen("จำไว้"));   // ชั้นที่ 3: สอนข้อใหม่
         } else {
-            generate(&transformer, &tokenizer, &sampler, prompt, steps);
+            int ki = kb_lookup(prompt);                     // ชั้นที่ 1: ค้น KB
+            if (ki >= 0) {
+                fb_puts(g_kb[ki].a);
+                fb_putc('\n');
+            } else {
+                fb_puts("ไม่ทราบ\n");                       // ชั้นที่ 2: ซื่อสัตย์
+            }
         }
     }
 
