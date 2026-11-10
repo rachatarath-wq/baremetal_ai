@@ -2371,6 +2371,16 @@ static int  gChatLines = 0;
 
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
+/* --- live model state: built at boot by efi_main, swapped by /loadmodel ---- */
+static Transformer gTransformer;          /* active checkpoint weights          */
+static Tokenizer   gTokenizer;            /* tokenizer for the active vocab size */
+static Sampler     gSampler;              /* sampling params + probindex buffer */
+static VOID       *gTokenizerData = NULL; /* raw tokenizer.bin buffer (shared)  */
+static int         gModelLoaded    = 0;   /* gTransformer holds a live model    */
+static float       gTemperature    = 1.0f;
+static float       gTopp           = 0.9f;
+static unsigned long long gSeed    = 1337;
+
 /* ----------------------------------------------------------------------------
  * 1. Mouse protocol: prefer EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), fall
  *    back to EFI_ABSOLUTE_POINTER_PROTOCOL (tablet), and reset whichever wins.
@@ -2892,12 +2902,128 @@ static void slash_split(char *s, char **cmd, char **arg) {
     }
 }
 
-/* Placeholder: swap the active checkpoint.  A real implementation must tear down
- * the current Transformer/Tokenizer, read `filename` off the boot volume and
- * rebuild them (see read_file / build_transformer in efi_main). */
+/* Turn an ASCII filename into a "\\name" CHAR16 path (the boot volume is flat,
+ * so every model sits in the root).  Returns 0 if the name is empty/non-ASCII. */
+static int make_model_path(CHAR16 *out, int cap, const char *name) {
+    if (name == NULL || *name == '\0') return 0;
+    int i = 0;
+    out[i++] = L'\\';
+    while (i < cap - 1 && *name) {
+        if ((unsigned char)*name >= 0x80) { out[i] = 0; return 0; }
+        out[i++] = (CHAR16)(unsigned char)*name++;
+    }
+    out[i] = 0;
+    return i;
+}
+
+/* True if `name` (in the boot-volume root) starts with the Q8_0 v2 model magic,
+ * so /listmodel shows only real checkpoints (not tokenizer.bin). */
+static int is_model_checkpoint(const char *name) {
+    CHAR16 path[256];
+    if (make_model_path(path, 256, name) <= 1) return 0;
+    EFI_FILE_HANDLE f = NULL;
+    EFI_STATUS st = uefi_call_wrapper(gRoot->Open, 5, gRoot, &f, path,
+                                      EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(st) || f == NULL) return 0;
+    UINT8 hdr[4];
+    UINTN sz = 4;
+    st = uefi_call_wrapper(f->Read, 3, f, &sz, hdr);
+    uefi_call_wrapper(f->Close, 1, f);
+    if (EFI_ERROR(st) || sz < 4) return 0;
+    UINT32 magic = 0;
+    memcpy(&magic, hdr, sizeof(magic));
+    return magic == 0x616b3432;
+}
+
+/* Enumerate "*.bin" files in the boot-volume root into `names` (ASCII) and
+ * return the count (capped at `max`).  Uses directory Read on the root handle,
+ * resetting its position so repeated /listmodel calls start from the top. */
+static int list_model_files(char names[][64], int max) {
+    UINTN buf_size = SIZE_OF_EFI_FILE_INFO + 256;
+    EFI_FILE_INFO *info = AllocateZeroPool(buf_size);
+    if (info == NULL) return 0;
+
+    uefi_call_wrapper(gRoot->SetPosition, 2, gRoot, (UINT64)0);
+
+    int n = 0;
+    while (n < max) {
+        UINTN sz = buf_size;
+        EFI_STATUS st = uefi_call_wrapper(gRoot->Read, 3, gRoot, &sz, info);
+        if (st == EFI_BUFFER_TOO_SMALL) {
+            FreePool(info);
+            buf_size = sz;
+            info = AllocateZeroPool(buf_size);
+            if (info == NULL) return n;
+            continue;
+        }
+        if (EFI_ERROR(st) || sz == 0) break;   /* end of directory            */
+        if (info->Attribute & EFI_FILE_DIRECTORY) continue;
+
+        char ascii[64]; int len = 0, ok = 1;
+        for (int i = 0; info->FileName[i]; i++) {
+            if (info->FileName[i] >= 0x80) { ok = 0; break; }  /* non-ASCII name */
+            if (len < 63) ascii[len++] = (char)info->FileName[i];
+        }
+        ascii[len] = '\0';
+        if (ok && len >= 4 && strcmp(ascii + len - 4, ".bin") == 0
+                 && is_model_checkpoint(ascii)) {
+            strcpy(names[n], ascii);
+            n++;
+        }
+    }
+    FreePool(info);
+    return n;
+}
+
+/* Swap the active checkpoint: read `filename` off the boot volume, build the new
+ * Transformer, and rebuild the Tokenizer/Sampler only if the vocab size changed.
+ * The old model is freed only after the new one is fully built, so a bad
+ * checkpoint leaves the current model untouched. */
 static void load_new_model(const char *filename) {
+    CHAR16 path[256];
+    if (make_model_path(path, 256, filename) <= 1) {
+        gui_chat_add2("> bad model name: ", filename);
+        return;
+    }
     gui_chat_add2("> loading model: ", filename);
-    gui_chat_add("> (load_new_model is a placeholder)");
+
+    VOID *data = NULL;
+    UINTN size = 0;
+    EFI_STATUS st = read_file(gRoot, path, 1, &data, &size);
+    if (EFI_ERROR(st) || data == NULL) {
+        gui_chat_add("> error: could not read checkpoint");
+        return;
+    }
+
+    Transformer next;
+    if (build_transformer(&next, data, size) != 0) {
+        uefi_call_wrapper(BS->FreePages, 2, (UINTN)data, EFI_SIZE_TO_PAGES(size));
+        gui_chat_add("> error: invalid model checkpoint");
+        return;
+    }
+
+    /* Rebuild tokenizer/sampler only when the vocab size actually changes
+     * (tokenizer.bin holds one vocab; both shipped models use 32000). */
+    if (gModelLoaded && next.config.vocab_size != gTokenizer.vocab_size) {
+        free_tokenizer(&gTokenizer);
+        build_tokenizer(&gTokenizer, gTokenizerData, next.config.vocab_size);
+        free_sampler(&gSampler);
+        build_sampler(&gSampler, next.config.vocab_size, gTemperature, gTopp, gSeed);
+    }
+
+    if (gModelLoaded) free_transformer(&gTransformer);
+    gTransformer = next;
+    gModelLoaded = 1;
+
+    char buf[96];
+    int n = 0;
+    const char *p;
+    for (p = "> model loaded OK (dim="; *p; p++) buf[n++] = *p;
+    gui_itoa(gTransformer.config.dim, buf + n); while (buf[n]) n++;
+    for (p = " vocab="; *p; p++) buf[n++] = *p;
+    gui_itoa(gTransformer.config.vocab_size, buf + n); while (buf[n]) n++;
+    buf[n++] = ')'; buf[n] = '\0';
+    gui_chat_add(buf);
 }
 
 static void process_slash_command(char *input) {
@@ -2923,10 +3049,20 @@ static void process_slash_command(char *input) {
         gui_chat_add(">   /clear           clear this chat");
         gui_chat_add(">   /help            show this list");
         gui_chat_add(">   /loadmodel FILE  load a model checkpoint");
+        gui_chat_add(">   /listmodel       list available models");
         gui_chat_add(">   /train           enter training mode");
     } else if (strcmp(cmd, "loadmodel") == 0) {
         if (arg && *arg) load_new_model(arg);
         else             gui_chat_add("> usage: /loadmodel <filename>");
+    } else if (strcmp(cmd, "listmodel") == 0) {
+        char names[16][64];
+        int cnt = list_model_files(names, 16);
+        if (cnt == 0) {
+            gui_chat_add("> no models found (*.bin in boot root)");
+        } else {
+            gui_chat_add("> models:");
+            for (int i = 0; i < cnt; i++) gui_chat_add2(">   ", names[i]);
+        }
     } else if (strcmp(cmd, "train") == 0) {
         gTrainingMode = 1;
         gui_chat_add("> training mode ON (placeholder)");
@@ -3145,9 +3281,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     CHAR16 *checkpoint_name = L"\\stories15M_thai_q80.bin";
     CHAR16 *tokenizer_name  = L"\\tokenizer.bin";
     int     steps           = 256;      // number of tokens to generate
-    float   temperature     = 1.0f;     // 0.0 = greedy
-    float   topp            = 0.9f;     // nucleus sampling
-    unsigned long long seed = 1337;     // bare metal has no time(NULL); use a fixed seed
+    gTemperature = 1.0f;                // 0.0 = greedy
+    gTopp        = 0.9f;                // nucleus sampling
+    gSeed        = 1337;                // bare metal has no time(NULL); use a fixed seed
 
     // locate the volume this image was loaded from and open its root directory
     EFI_FILE_HANDLE root = open_root_volume(ImageHandle);
@@ -3169,19 +3305,18 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
               checkpoint_name, checkpoint_size, checkpoint_size / (1024 * 1024));
 
     // build the Transformer from the in-memory checkpoint
-    Transformer transformer;
-    if (build_transformer(&transformer, checkpoint_data, checkpoint_size) != 0) {
+    if (build_transformer(&gTransformer, checkpoint_data, checkpoint_size) != 0) {
         fb_puts("error: invalid model checkpoint\n");
         return EFI_LOAD_ERROR;
     }
-    if (steps == 0 || steps > transformer.config.seq_len) {
-        steps = transformer.config.seq_len; // override to ~max length
+    if (steps == 0 || steps > gTransformer.config.seq_len) {
+        steps = gTransformer.config.seq_len; // override to ~max length
     }
     fb_printf("config: dim=%d hidden=%d layers=%d heads=%d kv_heads=%d vocab=%d seq_len=%d\n",
-              transformer.config.dim, transformer.config.hidden_dim,
-              transformer.config.n_layers, transformer.config.n_heads,
-              transformer.config.n_kv_heads, transformer.config.vocab_size,
-              transformer.config.seq_len);
+              gTransformer.config.dim, gTransformer.config.hidden_dim,
+              gTransformer.config.n_layers, gTransformer.config.n_heads,
+              gTransformer.config.n_kv_heads, gTransformer.config.vocab_size,
+              gTransformer.config.seq_len);
 
     // read and build the tokenizer
     VOID *tokenizer_data = NULL;
@@ -3192,12 +3327,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
                   tokenizer_name, (UINT64)status);
         return EFI_LOAD_ERROR;
     }
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_data, transformer.config.vocab_size);
+    gTokenizerData = tokenizer_data;
+    build_tokenizer(&gTokenizer, tokenizer_data, gTransformer.config.vocab_size);
 
     // build the Sampler
-    Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, seed);
+    build_sampler(&gSampler, gTransformer.config.vocab_size, gTemperature, gTopp, gSeed);
+    gModelLoaded = 1;
 
     // load the knowledge base; a matched fact is answered verbatim (no
     // generation), so known questions stop being hallucinated
@@ -3210,10 +3345,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     gui_run(SystemTable->ConIn, root);
 
     // memory and file handle cleanup
-    free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
-    FreePool(tokenizer_data);
+    free_sampler(&gSampler);
+    free_tokenizer(&gTokenizer);
+    free_transformer(&gTransformer);
+    FreePool(gTokenizerData);
     // checkpoint_data is freed by free_transformer()
     if (g_kb)        FreePool(g_kb);
     if (g_kb_data)   FreePool(g_kb_data);
