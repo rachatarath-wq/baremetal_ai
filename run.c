@@ -3702,6 +3702,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
 
     InitializeLib(ImageHandle, SystemTable);
 
+    // Disable the UEFI watchdog timer.  OVMF's BDS arms a 5-minute watchdog
+    // before invoking this boot option (UEFI spec 7.5 SetWatchdogTimer); if we
+    // never cancel it, the firmware resets/shuts the machine down ~5 minutes in
+    // — which looks like a spontaneous "crash" while the GUI idles.
+    uefi_call_wrapper(BS->SetWatchdogTimer, 4, 0, 0, 0, NULL);
+
     // Switch to a graphics mode and take the framebuffer before printing
     // anything, so every message from here on lands on the GOP display.  (If
     // this fails, Simple Text Output is still valid and Print still works.)
