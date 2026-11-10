@@ -2321,7 +2321,23 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 #define GUI_STATUS_H       40    /* top status bar height, px                  */
 #define CARET_W            3     /* input caret (text cursor) width, px        */
 
+/* Emotion panel (top-right): a drawn face + Thai caption for the AI's mood. */
+#define EMOTION_FACE       32    /* face diameter, px                           */
+#define EMOTION_PAD        10    /* inner padding inside the panel              */
+#define EMOTION_GAP        10    /* gap between the face and its caption        */
+#define EMOTION_PANEL_H    52    /* panel height, px                            */
+#define EMOTION_THINK_US   600000 /* simulated "thinking" pause, microseconds   */
+#define EMOTION_HOLD_LOOPS 250   /* answer mood -> idle after ~2.5 s (10ms ticks) */
+
 typedef struct { int x, y, w, h; } GuiRect;
+
+/* The AI's on-screen mood: drawn as a face + Thai caption in the top-right. */
+typedef enum {
+    EMOTION_IDLE,       /* nobody is asking yet  */
+    EMOTION_THINKING,   /* working on an answer  */
+    EMOTION_HAPPY,      /* just answered         */
+    EMOTION_CONFUSED,   /* did not find an answer */
+} Emotion;
 
 /* --- global state ---------------------------------------------------------- */
 
@@ -2347,38 +2363,42 @@ static int  gInputLen = 0;
 static int    gCaretVisible = 1;     /* input caret on/off (blinks while idle) */
 static UINT32 gCaretAccumUs = 0;      /* caret blink accumulator, microseconds  */
 
+static Emotion gEmotion = EMOTION_IDLE; /* current on-screen mood                */
+static int     gEmotionHoldLoops = 0;   /* ticks left before reverting to idle   */
+
 static char gChatLog[GUI_CHAT_MAX_LINES][GUI_CHAT_LINE_LEN];
 static int  gChatLines = 0;
 
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
 /* ----------------------------------------------------------------------------
- * 1. Mouse protocol: prefer EFI_ABSOLUTE_POINTER_PROTOCOL (tablet), fall back
- *    to EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), and reset whichever wins.
+ * 1. Mouse protocol: prefer EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), fall
+ *    back to EFI_ABSOLUTE_POINTER_PROTOCOL (tablet), and reset whichever wins.
  * ------------------------------------------------------------------------- */
 
 static EFI_STATUS init_mouse(void) {
-    /* Absolute tablet first: QEMU's usb-tablet exposes this protocol, and its
-     * absolute coordinates map directly onto the screen (no accumulation). */
+    /* Relative mouse first.  OVMF's UsbMouseAbsolutePointerDxe (the absolute
+     * tablet driver) mis-handles QEMU's usb-tablet: it forces HID boot
+     * protocol (which the tablet STALLs) and then reads the 5-byte absolute
+     * report as a 3-byte boot-mouse report, so the cursor moves garbage.  The
+     * relative SimplePointer is the one that actually works. */
     EFI_STATUS st = uefi_call_wrapper(BS->LocateProtocol, 3,
-                                      &AbsolutePointerProtocol, NULL,
-                                      (VOID **)&gAbsMouse);
-    if (!EFI_ERROR(st) && gAbsMouse != NULL) {
-        uefi_call_wrapper(gAbsMouse->Reset, 2, gAbsMouse, FALSE);
+                                      &SimplePointerProtocol, NULL,
+                                      (VOID **)&gMouse);
+    if (!EFI_ERROR(st) && gMouse != NULL) {
+        uefi_call_wrapper(gMouse->Reset, 2, gMouse, FALSE);
         return EFI_SUCCESS;
     }
-    gAbsMouse = NULL;
+    gMouse = NULL;
 
     st = uefi_call_wrapper(BS->LocateProtocol, 3,
-                           &SimplePointerProtocol, NULL,
-                           (VOID **)&gMouse);
-    if (EFI_ERROR(st) || gMouse == NULL) {
-        gMouse = NULL;
+                           &AbsolutePointerProtocol, NULL,
+                           (VOID **)&gAbsMouse);
+    if (EFI_ERROR(st) || gAbsMouse == NULL) {
+        gAbsMouse = NULL;
         return EFI_UNSUPPORTED;
     }
-    /* Best-effort reset: zeroes the relative origin.  A machine with no mouse
-     * reports an error here but GetState() may still work, so ignore it. */
-    uefi_call_wrapper(gMouse->Reset, 2, gMouse, FALSE);
+    uefi_call_wrapper(gAbsMouse->Reset, 2, gAbsMouse, FALSE);
     return EFI_SUCCESS;
 }
 
@@ -2514,6 +2534,102 @@ static void gui_draw_status(void) {
     gui_text(gStatusBar.x + GUI_PAD, gStatusBar.y + (GUI_STATUS_H - HRFONT_H) / 2,
              buf, gColText, gColInputBg);
 }
+
+/* ----------------------------------------------------------------------------
+ * 3a'. Emotion panel (top-right): a drawn face + Thai caption that reflects the
+ *      AI's current mood (idle / thinking / answered / confused).
+ * ------------------------------------------------------------------------- */
+
+/* Display cells a UTF-8 string occupies (Thai combining marks have advance 0,
+ * so byte length over-counts them). */
+static int gui_text_cells(const char *s) {
+    const char *p = s;
+    int cells = 0;
+    while (*p) {
+        UINT32 cp = hrf_decode_utf8(&p);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv != 0) cells++;
+    }
+    return cells;
+}
+
+static const char *gui_emotion_text(Emotion e) {
+    switch (e) {
+    case EMOTION_THINKING: return "กำลังคิดหนัก...";
+    case EMOTION_HAPPY:    return "ได้คำตอบแล้ว!";
+    case EMOTION_CONFUSED: return "ไม่รู้เลย...";
+    default:               return "รอคำถามอยู่...";
+    }
+}
+
+/* 2px-thick arc: dir +1 = lower half (smile "⌣"), dir -1 = upper half (frown
+ * "⌢").  Points where (r-th)^2 < x^2+y^2 <= r^2 on the chosen side. */
+static void face_arc(int cx, int cy, int r, int dir, int th, UINT32 color) {
+    for (int dy = 0; dy <= r; dy++) {
+        int yy = cy + dir * dy;
+        for (int dx = -r; dx <= r; dx++) {
+            int d = dx * dx + dy * dy;
+            if (d <= r * r && d > (r - th) * (r - th))
+                DrawPixel((UINT32)(cx + dx), (UINT32)yy, color);
+        }
+    }
+}
+
+static void gui_draw_face(int cx, int cy, Emotion e) {
+    int r = EMOTION_FACE / 2;
+    UINT32 skin = fb_make_color(0xFF, 0xD9, 0x3D);
+    UINT32 feat = fb_make_color(0x3A, 0x2A, 0x00);
+
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+            if (dx * dx + dy * dy <= r * r)
+                DrawPixel((UINT32)(cx + dx), (UINT32)(cy + dy), skin);
+
+    int ey = cy - 6;
+    if (e == EMOTION_THINKING) ey = cy - 9;   /* eyes drift up while pondering */
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++)
+            if (dx * dx + dy * dy <= 4) {
+                DrawPixel((UINT32)(cx - 7 + dx), (UINT32)(ey + dy), feat);
+                DrawPixel((UINT32)(cx + 7 + dx), (UINT32)(ey + dy), feat);
+            }
+
+    switch (e) {
+    case EMOTION_HAPPY:
+        face_arc(cx, cy + 3, 7, +1, 2, feat);          /* smile */
+        break;
+    case EMOTION_CONFUSED:
+        face_arc(cx, cy + 11, 6, -1, 2, feat);         /* frown */
+        break;
+    case EMOTION_THINKING:                             /* small open "o" */
+        for (int dy = -3; dy <= 3; dy++)
+            for (int dx = -3; dx <= 3; dx++)
+                if (dx * dx + dy * dy <= 9)
+                    DrawPixel((UINT32)(cx + dx), (UINT32)(cy + 6 + dy), feat);
+        break;
+    default:                                           /* flat line (idle) */
+        fb_fill((UINT32)(cx - 6), (UINT32)(cy + 6), 13, 2, feat);
+        break;
+    }
+}
+
+static void gui_draw_emotion(void) {
+    const char *txt = gui_emotion_text(gEmotion);
+    int w = EMOTION_PAD + EMOTION_FACE + EMOTION_GAP
+          + gui_text_cells(txt) * HRFONT_W + EMOTION_PAD;
+    int h = EMOTION_PANEL_H;
+    int x = (int)gFbWidth - GUI_PAD - w;
+    int y = GUI_STATUS_H + 8;
+
+    UINT32 bg = fb_make_color(0x24, 0x2E, 0x3C);
+    draw_filled_rect(x, y, w, h, bg);
+    draw_rect(x, y, w, h, gColBorder);
+
+    gui_draw_face(x + EMOTION_PAD + EMOTION_FACE / 2, y + h / 2, gEmotion);
+    gui_text(x + EMOTION_PAD + EMOTION_FACE + EMOTION_GAP,
+             y + (h - HRFONT_H) / 2, txt, gColText, bg);
+}
+
 
 /* ----------------------------------------------------------------------------
  * 3b. Layout, then the chat log, input box and Send button.
@@ -2665,6 +2781,7 @@ static void gui_draw_desktop(void) {
     gui_draw_chat();
     gui_draw_input();
     gui_draw_send_button();
+    gui_draw_emotion();
 }
 
 /* Redraw helpers wrap the cursor save/restore so any repaint that could sit
@@ -2685,6 +2802,19 @@ static void gui_repaint_chat(void) {
     mouse_restore();
     gui_draw_chat();
     gui_draw_input();
+    gui_draw_emotion();
+    gui_refresh_cursor();
+}
+
+/* Change the on-screen mood and repaint the emotion panel immediately (used for
+ * the transient "thinking" state while the KB/AI path runs). */
+static void gui_set_emotion(Emotion e) {
+    if (e == gEmotion) return;
+    gEmotion = e;
+    gEmotionHoldLoops = (e == EMOTION_HAPPY || e == EMOTION_CONFUSED)
+                      ? EMOTION_HOLD_LOOPS : 0;
+    mouse_restore();
+    gui_draw_emotion();
     gui_refresh_cursor();
 }
 
@@ -2817,13 +2947,17 @@ static void gui_send(void) {
     } else {
         gui_chat_add2("You: ", gInputBuf);
 
+        gui_set_emotion(EMOTION_THINKING);              /* "thinking hard"   */
+        uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
+
         if (strncmp(gInputBuf, "จำไว้", strlen("จำไว้")) == 0) {
             kb_remember(gRoot, gInputBuf + strlen("จำไว้"));   /* teach a new fact */
             gui_chat_add("จำไว้แล้ว");
+            gui_set_emotion(EMOTION_HAPPY);
         } else {
             int ki = kb_lookup(gInputBuf);                     /* answer from KB   */
-            if (ki >= 0) gui_chat_add(g_kb[ki].a);
-            else         gui_chat_add("ไม่ทราบ");
+            if (ki >= 0) { gui_chat_add(g_kb[ki].a); gui_set_emotion(EMOTION_HAPPY); }
+            else         { gui_chat_add("ไม่ทราบ");    gui_set_emotion(EMOTION_CONFUSED); }
         }
     }
 
@@ -2973,7 +3107,11 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
         /* 3. blink the input caret while idle */
         gui_caret_blink();
 
-        /* 4. idle yield so we do not spin the CPU at 100% */
+        /* 4. revert a transient answer-mood back to idle once the hold expires */
+        if (gEmotionHoldLoops > 0 && --gEmotionHoldLoops == 0)
+            gui_set_emotion(EMOTION_IDLE);
+
+        /* 5. idle yield so we do not spin the CPU at 100% */
         uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
     }
 }

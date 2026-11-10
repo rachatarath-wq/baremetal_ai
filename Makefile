@@ -76,7 +76,7 @@ qemu: install
 	$(QEMU) -machine q35 -m 512 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	  -drive file=fat:rw:fat_usb,if=ide,format=raw \
-	  -device qemu-xhci -device usb-kbd -device usb-tablet \
+	  -device qemu-xhci -device usb-kbd -device usb-mouse \
 	  -vga std
 
 # Headless: no window, expose a QMP socket so another process can screendump.
@@ -87,7 +87,7 @@ qemu-headless: install
 	$(QEMU) -machine q35 -m 512 \
 	  -drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 	  -drive file=fat:rw:fat_usb,if=ide,format=raw \
-	  -device qemu-xhci -device usb-kbd -device usb-tablet \
+	  -device qemu-xhci -device usb-kbd -device usb-mouse \
 	  -display none -vga std -monitor none \
 	  -qmp unix:/tmp/qemu_bm.sock,server=on,wait=off \
 	  -no-reboot
