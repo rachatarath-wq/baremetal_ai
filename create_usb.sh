@@ -99,6 +99,15 @@ if [[ ! -d "$SRC_DIR" ]]; then
     echo "ERROR: source directory not found: $SRC_DIR"
     exit 1
 fi
+
+# Sync the latest Q8_0 model .bin files (and tokenizer.bin / kb.txt) from the
+# repo root into fat_usb/ first, so newly exported domain models are included.
+if [[ -x "$SCRIPT_DIR/sync_models.sh" ]]; then
+    echo ""
+    echo "==> Syncing model .bin files into $SRC_DIR ..."
+    "$SCRIPT_DIR/sync_models.sh"
+fi
+
 SRC_BYTES="$(du -sk "$SRC_DIR" | awk '{print $1*1024}')"
 
 # Make sure the target is big enough for the files.
