@@ -35,10 +35,9 @@ int steps = 256;
 
 ### ใช้บนเครื่องจริง (USB)
 
-1. ฟอร์แมต USB เป็น FAT32 (GPT + EFI System Partition)
-2. วาง `stories15M_q80.bin` และ `tokenizer.bin` ไว้ที่ **root** ของ drive
-3. `make install` (copy `BOOTX64.EFI` ไป `EFI/BOOT/`)
-4. บูต USB ในโหมด UEFI
+พิมพ์ `/createboot <disk>` ใน Claude Code (หรือรัน `sudo ./create_usb.sh <disk>`) —
+script จะฟอร์แมต USB เป็น FAT32 แล้ว copy `BOOTX64.EFI`, โมเดล `.bin`, `tokenizer.bin`,
+`kb.txt` ลง root แล้ว eject ให้อัตโนมัติ จากนั้นบูต USB ในโหมด UEFI
 
 **ความเร็วอ้างอิง:** ใน QEMU แบบ TCG บน Apple Silicon ได้ ~14.6 tok/s — บนเครื่องจริงจะเร็วกว่านี้มาก
 
@@ -158,7 +157,40 @@ swift /tmp/ocr.swift
 
 ---
 
-## 4. ขยายตัวอักษร (font scaling)
+## 4. เกมในตัว (5 เกม)
+
+พิมพ์ `/games` ในหน้าคุย → ขึ้น dropdown เลือกเกม (↑/↓ เลื่อน, Enter เริ่ม, ESC ยกเลิก)
+หรือเริ่มเกมตรง ๆ ได้เลย:
+
+| เกม | คำสั่ง | ควบคุม |
+|-----|--------|--------|
+| Pac-Man | `/games pacman [auto]` | ลูกศร / WASD เคลื่อนที่, Q/ESC ออก (มีโหมด auto) |
+| Snake (งูกินหาง) | `/games snake` | ลูกศร / WASD เลี้ยว, กดครั้งแรกเริ่ม, Q/ESC ออก |
+| XO (Tic-tac-toe) | `/games xo` / `tic` | ลูกศรเลื่อน + Enter วาง X (สู้ AI) |
+| Pong (ปอง) | `/games pong` | W/S หรือ ↑/↓ เลื่อนไม้ (สู้ AI) |
+| Tetris (ต่อบล็อก) | `/games tetris` | ←/→ เลื่อน, ↑ หมุน, ↓ ลงเร็ว, Space ลงสุด, Q/ESC ออก |
+
+กด **Q** หรือ **ESC** เพื่อออกจากเกมกลับหน้าคุย
+
+### ทดสอบเกมใน QEMU
+
+ใช้ QMP เหมือนตอน 3.3 — กดลูกศร/Enter ได้ผ่าน QMP qcode (`up`, `down`, `left`, `right`,
+`ret`, `spc`, `esc`):
+
+```bash
+# เปิด dropdown เกม
+tools/venv/bin/python tools/qemu_type.py /tmp/qemu_bm.sock --start-mode en --en "/games"
+# เลื่อนลง + Enter เริ่ม Snake
+python /tmp/qemu_nav.py /tmp/qemu_bm.sock --keys down,ret
+# เล่น/ดู แล้วออก
+python /tmp/qemu_nav.py /tmp/qemu_bm.sock --keys q
+```
+
+(สคริปต์ `/tmp/qemu_nav.py` รับ `--keys down,ret,esc` กับ repeat เช่น `right:3` และ `--shot` จับภาพ)
+
+---
+
+## 5. ขยายตัวอักษร (font scaling)
 
 ขยายตัวอักษรด้วย **scale factor** — ฟอนต์ bitmap ยังเป็น 8×16 เหมือนเดิม แต่ตอนวาดจะขยาย
 แต่ละพิกเซลเป็นบล็อก `FONT_SCALE × FONT_SCALE` (nearest-neighbor)
@@ -179,6 +211,6 @@ swift /tmp/ocr.swift
 
 ---
 
-## 5. หมายเหตุ
+## 6. หมายเหตุ
 
 - `README.md` เขียนไว้ตอนใช้ `stories15M.bin` + "ASCII-only" — ไฟล์นี้เป็นคู่มือปัจจุบัน

@@ -132,10 +132,27 @@ make clean
 
 ## Deploy to hardware
 
-1. Format a USB drive FAT32 (GPT, with an EFI System Partition).
-2. Copy `stories15M.bin` and `tokenizer.bin` to the **root** of the drive.
-3. `make install` (places `BOOTX64.EFI` at `EFI/BOOT/`).
-4. Boot the USB in **UEFI mode**.
+Run `/createboot <disk>` in Claude Code (or `sudo ./create_usb.sh <disk>`): the script
+formats the USB as FAT32, copies `BOOTX64.EFI`, the model `.bin`, `tokenizer.bin` and
+`kb.txt`, then ejects it. Boot the USB in **UEFI mode**.
+
+---
+
+## Games
+
+Besides chatting with the model, `BOOTX64.EFI` ships five classic games drawn directly to
+the framebuffer (no sprite library — every pixel is written by hand):
+
+| Game | Command | Controls |
+|------|---------|----------|
+| Pac-Man | `/games pacman [auto]` | Arrows / WASD to steer · Q/ESC to quit · `auto` lets the AI play |
+| Snake | `/games snake` | Arrows / WASD to turn · first press starts · Q/ESC to quit |
+| XO (Tic-tac-toe) | `/games xo` / `tic` | Arrows to move + Enter to place X (vs. AI) |
+| Pong | `/games pong` | W/S or ↑/↓ to move the paddle (vs. AI) |
+| Tetris | `/games tetris` | ←/→ move · ↑ rotate · ↓ soft drop · Space hard drop · Q/ESC quit |
+
+Type `/games` with no argument to open a picker dropdown (↑/↓ to move, Enter to start, ESC
+to cancel). See [`GUIDE_THAI.md`](GUIDE_THAI.md) for the Thai guide.
 
 ---
 

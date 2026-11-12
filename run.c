@@ -1709,6 +1709,9 @@ static EFI_STATUS init_gop(void) {
 #define KBD_SCAN_UP    0x01
 #define KBD_SCAN_DOWN  0x02
 
+/* ESC, used to cancel the model-picker drop-down. */
+#define KBD_SCAN_ESC   0x17
+
 /* 1 = Thai input mode (map US keys to Thai via Kedmanee), 0 = English. */
 static int gThaiMode = 0;
 
@@ -2339,7 +2342,6 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 #define GUI_INPUT_LEN      512   /* editable input buffer, bytes               */
 #define GUI_CHAT_MAX_LINES 48
 #define GUI_CHAT_LINE_LEN  300   /* bytes: room for 80 three-byte Thai chars   */
-#define GUI_CHAT_CHARS     80    /* characters per wrapped chat line           */
 #define GUI_STATUS_H       40    /* top status bar height, px                  */
 #define CARET_W            3     /* input caret (text cursor) width, px        */
 
@@ -2399,10 +2401,35 @@ static int  gChatLines = 0;
 
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
-/* game mode: 0 = chat GUI, 1 = Pacman (entered via /games pacman) */
-#define GAME_MODE_NONE   0
-#define GAME_MODE_PACMAN 1
+/* Game modes: 0 = chat GUI, the rest are entered via /games (or its picker). */
+#define GAME_MODE_NONE    0
+#define GAME_MODE_PACMAN  1
+#define GAME_MODE_SNAKE   2
+#define GAME_MODE_XO      3
+#define GAME_MODE_PONG    4
+#define GAME_MODE_TETRIS  5
 static int gGameMode = GAME_MODE_NONE;
+
+/* Game list for the /games picker — the index is the GAME_MODE_* value. */
+static const char *const gGameLabels[] = {
+    "Pac-Man",
+    "Snake (งูกินหาง)",
+    "XO (Tic-tac-toe)",
+    "Pong (ปอง)",
+    "Tetris (ต่อบล็อก)",
+};
+#define GAME_COUNT ((int)(sizeof(gGameLabels) / sizeof(gGameLabels[0])))
+
+/* Shared tick accumulator for the game loop (microseconds). */
+static UINT64 gGameAccum = 0;
+
+/* Forward declarations: used by the picker and the slash-command handler before
+ * the game sections that define these are reached further down. */
+static void gui_start_game(int idx);
+static void gui_open_game_picker(void);
+static void gui_game_key(EFI_INPUT_KEY key);
+static void gui_game_tick(void);
+static int  gui_game_tick_us(void);
 
 /* screensaver state (chat desktop) */
 static UINT64 gIdleUs = 0;         /* microseconds since the last input         */
@@ -2421,6 +2448,18 @@ static int         gModelLoaded    = 0;   /* gTransformer holds a live model    
 static float       gTemperature    = 1.0f;
 static float       gTopp           = 0.9f;
 static unsigned long long gSeed    = 1337;
+
+/* --- model picker: drop-down list of *.bin models for /loadmodel ---------- */
+#define MODEL_PICKER_MAX 16
+static int  gPickerOn    = 0;      /* 1 = the picker overlay is showing        */
+static char gPickerNames[MODEL_PICKER_MAX][64];
+static int  gPickerCount = 0;
+static int  gPickerSel   = 0;      /* highlighted row index                    */
+
+#define PICKER_MODEL 0
+#define PICKER_GAME  1
+static int        gPickerKind  = PICKER_MODEL;
+static const char *gPickerTitle = "เลือกโมเดล (Enter=เลือก, Esc=ยกเลิก)";
 
 /* ----------------------------------------------------------------------------
  * 1. Mouse protocol: prefer EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), fall
@@ -2731,30 +2770,44 @@ static void gui_chat_append(const char *line) {
     if (gChatLines < GUI_CHAT_MAX_LINES) gChatLines++;
 }
 
-/* Append `text` to the chat, wrapping into GUI_CHAT_CHARS-character lines on
- * UTF-8 boundaries (never splits a multi-byte Thai character). */
+/* Append `text` to the chat, wrapping into lines that fit the chat window's
+ * inner width (gChatBox.w minus the two GUI_PAD gutters).  Lines break on
+ * UTF-8 boundaries (never splits a multi-byte Thai character); Thai combining
+ * marks (advance 0) overlay the preceding consonant and occupy no column, so
+ * they are not counted and never force an early wrap.  Explicit '\n' in model
+ * output is honoured as a hard line break instead of being handed to the
+ * renderer (which would reset the cursor to screen column 0 and spill text
+ * outside the chat frame). */
 static void gui_chat_add(const char *text) {
+    int max_cells = ((int)gChatBox.w - 2 * GUI_PAD) / HRFONT_W;
+    if (max_cells < 1) max_cells = 1;
+
     const char *p = text;
     while (*p) {
         const char *seg = p;
-        int chars = 0;
-        while (*p && chars < GUI_CHAT_CHARS) {
-            unsigned char b = (unsigned char)*p;
-            int extra = 0;
-            if      ((b & 0xE0) == 0xC0) extra = 1;
-            else if ((b & 0xF0) == 0xE0) extra = 2;
-            else if ((b & 0xF8) == 0xF0) extra = 3;
-            p++;
-            for (int i = 0; i < extra && *p && ((unsigned char)*p & 0xC0) == 0x80; i++)
-                p++;
-            chars++;
+        int cells = 0;
+        while (*p) {
+            const char *np = p;
+            UINT32 cp = hrf_decode_utf8(&np);
+            if (cp < 0x20) break;   /* control char (\n \r \t ...) = hard break */
+            const HRFONT_glyph_t *g = hrf_lookup(cp);
+            int adv = (g != NULL) ? g->adv : HRFONT_W;   /* unknown -> '?' = 1 cell */
+            if (adv != 0 && cells + 1 > max_cells) break;
+            p = np;
+            if (adv != 0) cells++;
         }
         char line[GUI_CHAT_LINE_LEN];
         int n = 0;
         for (const char *q = seg; q < p && n < GUI_CHAT_LINE_LEN - 1; q++)
             line[n++] = *q;
         line[n] = '\0';
-        gui_chat_append(line);
+        if (n > 0) gui_chat_append(line);
+
+        /* Skip the control char(s) that ended this line; collapse blank lines. */
+        if (*p && (unsigned char)*p < 0x20) {
+            p++;
+            while (*p == '\n' || *p == '\r') p++;
+        }
     }
 }
 
@@ -2793,9 +2846,28 @@ static int gui_input_cells(void) {
     return cells;
 }
 
-/* Pixel x of the text caret, just past the last typed character. */
-static int gui_caret_x(void) {
-    return gInputBox.x + GUI_PAD + 3 * HRFONT_W + gui_input_cells() * HRFONT_W;
+/* Return a pointer into gInputBuf positioned at the first spacing glyph after
+ * skipping `skip` cells (plus the combining marks that trail each skipped
+ * glyph), so a long input can scroll to show its tail. */
+static const char *gui_skip_cells(const char *s, int skip) {
+    const char *p = s;
+    int skipped = 0;
+    while (*p && skipped < skip) {
+        const char *np = p;
+        UINT32 cp = hrf_decode_utf8(&np);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv != 0) skipped++;
+        p = np;
+    }
+    /* drop trailing combining marks so we never start on an orphaned mark */
+    while (*p) {
+        const char *np = p;
+        UINT32 cp = hrf_decode_utf8(&np);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv == 0) p = np;
+        else break;
+    }
+    return p;
 }
 
 static void gui_draw_input(void) {
@@ -2804,10 +2876,20 @@ static void gui_draw_input(void) {
     int ty = gInputBox.y + (gInputBox.h - HRFONT_H) / 2;
     /* language-mode chip, then the text being typed */
     gui_text(gInputBox.x + GUI_PAD, ty, gThaiMode ? "TH" : "EN", gColAccent, gColInputBg);
-    gui_text(gInputBox.x + GUI_PAD + 3 * HRFONT_W, ty, gInputBuf, gColText, gColInputBg);
-    /* blinking text cursor so the insertion point is always visible */
+
+    /* Scroll long input to its tail so it never spills past the input box. */
+    int tx   = gInputBox.x + GUI_PAD + 3 * HRFONT_W;   /* text/caret start x */
+    int maxc = (gInputBox.w - 2 * GUI_PAD - 3 * HRFONT_W) / HRFONT_W;
+    if (maxc < 1) maxc = 1;
+    int total = gui_input_cells();
+    int shown = total < maxc ? total : maxc;
+    const char *view = (total > maxc) ? gui_skip_cells(gInputBuf, total - maxc)
+                                      : gInputBuf;
+    gui_text(tx, ty, view, gColText, gColInputBg);
+
+    /* blinking text cursor just past the visible text, so it is always on box */
     if (gCaretVisible) {
-        int cx = gui_caret_x();
+        int cx = tx + shown * HRFONT_W;
         if (cx + CARET_W <= gInputBox.x + gInputBox.w - 4)
             draw_filled_rect(cx, ty, CARET_W, HRFONT_H, gColText);
     }
@@ -3068,6 +3150,99 @@ static void load_new_model(const char *filename) {
 }
 
 /* ----------------------------------------------------------------------------
+ * 4a'. Model picker: a drop-down list for /loadmodel.  Up/Down move the
+ *      highlight, Enter loads the selected checkpoint, Esc cancels.
+ * ------------------------------------------------------------------------- */
+
+static void gui_draw_picker(void) {
+    int W = (int)gFbWidth, H = (int)gFbHeight;
+    int row_h   = HRFONT_H;
+    int pad     = 12;                    /* vertical padding inside the box    */
+    int title_h = HRFONT_H + 2 * pad;   /* header row (title text) height      */
+
+    /* widest item name + selection marker, but at least the title width */
+    int w = 0;
+    for (int i = 0; i < gPickerCount; i++) {
+        int lw = gui_text_cells(gPickerNames[i]) * HRFONT_W + 3 * HRFONT_W;
+        if (lw > w) w = lw;
+    }
+    int tw = gui_text_cells(gPickerTitle) * HRFONT_W + 2 * GUI_PAD;
+    if (w < tw) w = tw;
+
+    int maxw = W - 2 * 48;
+    if (w > maxw) w = maxw;
+    int h = title_h + gPickerCount * row_h + 2 * pad;
+    if (h > H - 2 * 48) h = H - 2 * 48;
+
+    int x = (W - w) / 2;
+    int y = (H - h) / 2;
+
+    draw_filled_rect(x, y, w, h, gColChatBg);
+    draw_rect(x, y, w, h, gColAccent);
+
+    gui_text(x + GUI_PAD, y + pad, gPickerTitle, gColAccent, gColChatBg);
+
+    int list_y = y + title_h;
+    for (int i = 0; i < gPickerCount; i++) {
+        int row_y = list_y + i * row_h;
+        int sel   = (i == gPickerSel);
+        if (sel) draw_filled_rect(x + 4, row_y, w - 8, row_h, gColAccent);
+        char row[96];
+        int n = 0;
+        row[n++] = sel ? '>' : ' ';
+        row[n++] = ' ';
+        for (const char *p = gPickerNames[i]; *p && n < 95; p++) row[n++] = *p;
+        row[n] = '\0';
+        gui_text(x + GUI_PAD, row_y, row, sel ? gColChatBg : gColText,
+                 sel ? gColAccent : gColChatBg);
+    }
+}
+
+static void gui_open_model_picker(void) {
+    gPickerCount = list_model_files(gPickerNames, MODEL_PICKER_MAX);
+    if (gPickerCount == 0) {
+        gui_chat_add("> no models found (*.bin in boot root)");
+        return;
+    }
+    gPickerKind  = PICKER_MODEL;
+    gPickerTitle = "เลือกโมเดล (Enter=เลือก, Esc=ยกเลิก)";
+    gPickerSel = 0;
+    gPickerOn  = 1;
+    if (mouse_available()) mouse_restore();   /* don't leave a stale cursor     */
+    gui_draw_picker();
+}
+
+/* Handle a key while the picker is up.  Returns handled (caller should not fall
+ * through to normal typing). */
+static void gui_picker_key(EFI_INPUT_KEY key) {
+    if (key.ScanCode == KBD_SCAN_UP) {
+        if (gPickerSel > 0) { gPickerSel--; gui_draw_picker(); }
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DOWN) {
+        if (gPickerSel < gPickerCount - 1) { gPickerSel++; gui_draw_picker(); }
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_ESC) {
+        gPickerOn = 0;
+        gui_chat_add("> cancelled");
+        gui_repaint_chat();
+        return;
+    }
+    if (key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
+        gPickerOn = 0;
+        if (gPickerKind == PICKER_GAME) {
+            gui_start_game(gPickerSel);   /* paints the game board; keep it */
+        } else {
+            load_new_model(gPickerNames[gPickerSel]);
+            gui_repaint_chat();
+        }
+        return;
+    }
+    /* any other key is ignored while the picker is showing */
+}
+
+/* ----------------------------------------------------------------------------
  * 4b. Pacman minigame (/games pacman).  A grid maze on the raw framebuffer:
  *     arrow keys steer Pacman, ghosts chase, dots/pellets score, ESC returns.
  * ------------------------------------------------------------------------- */
@@ -3149,7 +3324,6 @@ static int gPacGhostDX[PAC_MAX_GHOSTS], gPacGhostDY[PAC_MAX_GHOSTS];
 static int gPacGhostSpawnX[PAC_MAX_GHOSTS], gPacGhostSpawnY[PAC_MAX_GHOSTS];
 static int gPacFright;                   /* remaining edible ticks (0 = normal) */
 
-static UINT64 gPacAccum;                 /* tick accumulator, microseconds       */
 static int gPacCell;                     /* maze cell size, px (fit to screen)   */
 static int gPacOX, gPacOY;               /* maze origin, px                      */
 
@@ -3251,11 +3425,11 @@ static void pac_draw_ghost(int i) {
     int cx = gPacOX + gPacGhostX[i] * cs + cs / 2;
     int cy = gPacOY + gPacGhostY[i] * cs + cs / 2;
     UINT32 body = gPacFright ? gPacFrightCol : gPacGhostCol[i];
-    int r  = cs / 2 - 9; if (r < 3) r = 3;
-    int to = r / 2;                       /* how far the dome rises above centre */
-    int ex = r / 2; if (ex < 2) ex = 2;   /* eye x offset                         */
-    int er = r / 3; if (er < 1) er = 1;   /* eye radius                           */
-    int fr = r / 3; if (fr < 1) fr = 1;   /* foot radius                          */
+    int r  = (cs - 2) / 3; if (r < 3) r = 3;   /* body radius (fills the cell)    */
+    int to = r / 2;                            /* how far the dome rises          */
+    int ex = r / 2; if (ex < 2) ex = 2;        /* eye x offset                    */
+    int er = r / 3; if (er < 1) er = 1;        /* eye radius                      */
+    int fr = r / 4; if (fr < 1) fr = 1;        /* foot radius (keeps feet in cell)*/
     pac_fill_circle(cx, cy - to, r, body);
     draw_filled_rect(cx - r, cy - to, 2 * r, r + to, body);
     pac_fill_circle(cx - r + fr * 2, cy + r + fr, fr, body);   /* wavy "feet"   */
@@ -3324,6 +3498,17 @@ static void pac_draw(void) {
     if (gPacOver) pac_draw_over();
 }
 
+/* Repaint one maze cell in place: erase to background, redraw its wall/dot/door,
+ * then draw Pacman and any ghosts whose centre is currently in it. */
+static void pac_repaint_cell(int x, int y) {
+    int cs = gPacCell;
+    draw_filled_rect(gPacOX + x * cs, gPacOY + y * cs, cs, cs, gPacBg);
+    pac_draw_cell(x, y);
+    for (int i = 0; i < gPacGhosts; i++)
+        if (gPacGhostX[i] == x && gPacGhostY[i] == y) pac_draw_ghost(i);
+    if (gPacX == x && gPacY == y) pac_draw_pacman();
+}
+
 static void pac_respawn(void) {
     gPacX = gPacSpawnX; gPacY = gPacSpawnY;
     gPacDirX = 1; gPacDirY = 0; gPacNextX = 1; gPacNextY = 0;
@@ -3354,7 +3539,6 @@ static void pac_init(void) {
     gPacOver = 0;
     gPacWon = 0;
     gPacFright = 0;
-    gPacAccum = 0;
     gPacAuto = 0;
     gPacDirX = 1; gPacDirY = 0; gPacNextX = 1; gPacNextY = 0;
     gPacGhosts = 0;
@@ -3618,12 +3802,32 @@ static void pac_collide(void) {
 
 static void pac_tick(void) {
     if (gPacOver) return;
+
+    /* Snapshot the current entity cells, then repaint only the cells that
+     * change.  The old full-screen clear every tick made the picture flash on
+     * real hardware and made the game feel slow. */
+    int opx = gPacX, opy = gPacY;
+    int ogx[PAC_MAX_GHOSTS], ogy[PAC_MAX_GHOSTS];
+    for (int i = 0; i < gPacGhosts; i++) { ogx[i] = gPacGhostX[i]; ogy[i] = gPacGhostY[i]; }
+
     if (gPacAuto) pac_auto_decide();
     pac_move_pacman();
+    int mpx = gPacX, mpy = gPacY;          /* post-move (pre-collide) cell */
     for (int i = 0; i < gPacGhosts; i++) pac_move_ghost(i);
     if (gPacFright) gPacFright--;
-    pac_collide();
-    pac_draw();
+    pac_collide();                         /* may respawn entities / set game over */
+
+    /* Repaint every cell an entity left or now occupies.  The intermediate
+     * pacman cell is included so a dot eaten just before death still clears. */
+    pac_repaint_cell(opx, opy);
+    pac_repaint_cell(mpx, mpy);
+    pac_repaint_cell(gPacX, gPacY);
+    for (int i = 0; i < gPacGhosts; i++) {
+        pac_repaint_cell(ogx[i], ogy[i]);
+        pac_repaint_cell(gPacGhostX[i], gPacGhostY[i]);
+    }
+    pac_draw_hud();
+    if (gPacOver) pac_draw_over();
 }
 
 static void pac_quit(void) {
@@ -3677,6 +3881,844 @@ static void pac_key(EFI_INPUT_KEY key) {
     }
 }
 
+/* ----------------------------------------------------------------------------
+ * 4c. More minigames (Snake, XO, Pong, Tetris) plus the shared dispatch that
+ *     the game loop and the /games picker drive.  Each game follows Pacman's
+ *     pattern: init() paints the full board, key() handles input, and tick()
+ *     advances time (XO is turn-based, so it has no tick).
+ * ------------------------------------------------------------------------- */
+
+#define SNAKE_W       24
+#define SNAKE_H       18
+#define SNAKE_MAXLEN  (SNAKE_W * SNAKE_H)
+#define SNAKE_TICK_US 130000
+
+#define XO_EMPTY 0
+#define XO_X     1
+#define XO_O     2
+
+#define PONG_TICK_US   33000   /* ~30 fps */
+#define PONG_PAD_W     18
+#define PONG_PAD_H     110
+#define PONG_BALL      12
+#define PONG_PAD_STEP  8
+#define PONG_HOLD_TICKS 5
+
+#define TET_W 10
+#define TET_H 20
+#define TET_FALL_BASE 480000
+#define TET_FALL_MIN   90000
+
+static int gTetFallUs = TET_FALL_BASE;   /* current gravity period (us) */
+
+/* Shared per-game exit: return to the chat desktop and put the mouse back. */
+static void game_quit(void) {
+    gGameMode = GAME_MODE_NONE;
+    gui_draw_desktop();
+    if (mouse_available()) { mouse_save(); mouse_draw(); }
+}
+
+/* Thick line via overlapping circles (used to draw the X mark and grid). */
+static void game_line(int x0, int y0, int x1, int y1, int thick, UINT32 c) {
+    int dx = x1 - x0, dy = y1 - y0;
+    int adx = pac_abs(dx), ady = pac_abs(dy);
+    int steps = (adx > ady) ? adx : ady;
+    if (steps < 1) steps = 1;
+    for (int i = 0; i <= steps; i++) {
+        int x = x0 + (int)(((long long)dx * i) / steps);
+        int y = y0 + (int)(((long long)dy * i) / steps);
+        pac_fill_circle(x, y, thick, c);
+    }
+}
+
+/* Clear a full-width horizontal band so a shorter status line can replace a
+ * longer one (e.g. the "GAME OVER" message vs the how-to-play hint). */
+static void game_clear_band(int y, int h, UINT32 bg) {
+    draw_filled_rect(0, y, (int)gFbWidth, h, bg);
+}
+
+/* --- Snake (งูกินหาง) ----------------------------------------------------- */
+
+static int gSnakeOX, gSnakeOY, gSnakeCell;
+static int gSnakeX[SNAKE_MAXLEN], gSnakeY[SNAKE_MAXLEN];
+static int gSnakeLen, gSnakeDX, gSnakeDY;
+static int gSnakeFX, gSnakeFY;            /* food cell */
+static int gSnakeOver, gSnakeScore, gSnakeStarted;
+static unsigned long long gSnakeRng;
+static UINT32 gSnakeBg, gSnakeWall, gSnakeFood, gSnakeHead, gSnakeBody, gSnakeText;
+
+static int gSnakeRandN(int n) {
+    if (n <= 1) return 0;
+    return (int)(random_u32(&gSnakeRng) % (unsigned)n);
+}
+
+static void snake_spawn_food(void) {
+    for (;;) {
+        int fx = gSnakeRandN(SNAKE_W), fy = gSnakeRandN(SNAKE_H);
+        int on = 0;
+        for (int i = 0; i < gSnakeLen; i++)
+            if (gSnakeX[i] == fx && gSnakeY[i] == fy) { on = 1; break; }
+        if (!on) { gSnakeFX = fx; gSnakeFY = fy; return; }
+    }
+}
+
+static void snake_draw_cell(int cx, int cy, UINT32 c) {
+    int cs = gSnakeCell;
+    draw_filled_rect(gSnakeOX + cx * cs + 1, gSnakeOY + cy * cs + 1, cs - 2, cs - 2, c);
+}
+
+static void snake_draw(void) {
+    int cs = gSnakeCell;
+    draw_filled_rect(gSnakeOX, gSnakeOY, SNAKE_W * cs, SNAKE_H * cs, gSnakeBg);
+    draw_rect(gSnakeOX, gSnakeOY, SNAKE_W * cs, SNAKE_H * cs, gSnakeWall);
+
+    int r = cs / 3; if (r < 2) r = 2;
+    pac_fill_circle(gSnakeOX + gSnakeFX * cs + cs / 2, gSnakeOY + gSnakeFY * cs + cs / 2,
+                    r, gSnakeFood);
+
+    for (int i = gSnakeLen - 1; i >= 0; i--)
+        snake_draw_cell(gSnakeX[i], gSnakeY[i], i == 0 ? gSnakeHead : gSnakeBody);
+
+    char buf[48]; int n = 0; const char *p;
+    for (p = "SNAKE  SCORE "; *p; p++) buf[n++] = *p;
+    gui_itoa(gSnakeScore, buf + n); while (buf[n]) n++;
+    buf[n] = '\0';
+    gui_text(gSnakeOX, gSnakeOY - 2 * HRFONT_H, buf, gSnakeText, gSnakeBg);
+
+    const char *hint = gSnakeOver
+        ? "GAME OVER  (Q/ESC = return)"
+        : (gSnakeStarted ? "Arrows / WASD = turn    Q/ESC = quit"
+                         : "Press an arrow key to start    Q/ESC = quit");
+    game_clear_band(gSnakeOY + SNAKE_H * cs + 20, HRFONT_H, gSnakeBg);
+    gui_text(gSnakeOX, gSnakeOY + SNAKE_H * cs + 20, hint,
+             gSnakeOver ? gSnakeFood : gSnakeText, gSnakeBg);
+}
+
+static void snake_init(void) {
+    gSnakeOY = 170;
+    int avail_h = (int)gFbHeight - gSnakeOY - 80;
+    int cell = avail_h / SNAKE_H;
+    if (cell * SNAKE_W > (int)gFbWidth) cell = (int)gFbWidth / SNAKE_W;
+    if (cell > 44) cell = 44;
+    if (cell < 16) cell = 16;
+    gSnakeCell = cell;
+    gSnakeOX = ((int)gFbWidth - SNAKE_W * cell) / 2;
+
+    int mx = SNAKE_W / 2, my = SNAKE_H / 2;
+    gSnakeLen = 3;
+    gSnakeX[0] = mx;     gSnakeY[0] = my;
+    gSnakeX[1] = mx - 1; gSnakeY[1] = my;
+    gSnakeX[2] = mx - 2; gSnakeY[2] = my;
+    gSnakeDX = 1; gSnakeDY = 0;
+    gSnakeScore = 0;
+    gSnakeOver = 0;
+    gSnakeStarted = 0;
+    gSnakeRng = (time_in_ms() * 0x9E3779B97F4A7C15ULL) | 1;
+
+    gSnakeBg   = fb_make_color(0x0A, 0x12, 0x0A);
+    gSnakeWall = fb_make_color(0x2E, 0x8B, 0x57);
+    gSnakeFood = fb_make_color(0xFF, 0x4B, 0x4B);
+    gSnakeHead = fb_make_color(0x7C, 0xFF, 0x4B);
+    gSnakeBody = fb_make_color(0x3A, 0xB8, 0x3A);
+    gSnakeText = fb_make_color(0xE6, 0xE6, 0xE6);
+
+    snake_spawn_food();
+    if (mouse_available()) mouse_restore();
+    fb_fill(0, 0, gFbWidth, gFbHeight, gSnakeBg);
+    snake_draw();
+}
+
+static void snake_tick(void) {
+    if (gSnakeOver || !gSnakeStarted) return;
+    int nx = gSnakeX[0] + gSnakeDX, ny = gSnakeY[0] + gSnakeDY;
+    int grow = (nx == gSnakeFX && ny == gSnakeFY);
+
+    if (nx < 0 || nx >= SNAKE_W || ny < 0 || ny >= SNAKE_H) {
+        gSnakeOver = 1; snake_draw(); return;
+    }
+    int lim = grow ? gSnakeLen : gSnakeLen - 1;   /* tail vacates when not growing */
+    for (int i = 0; i < lim; i++)
+        if (gSnakeX[i] == nx && gSnakeY[i] == ny) { gSnakeOver = 1; snake_draw(); return; }
+
+    for (int i = gSnakeLen - 1; i > 0; i--) {
+        gSnakeX[i] = gSnakeX[i - 1];
+        gSnakeY[i] = gSnakeY[i - 1];
+    }
+    gSnakeX[0] = nx; gSnakeY[0] = ny;
+    if (grow) {
+        gSnakeLen++;
+        gSnakeScore += 10;
+        if (gSnakeLen >= SNAKE_MAXLEN) gSnakeOver = 1;   /* filled the board: win */
+        else snake_spawn_food();
+    }
+    snake_draw();
+}
+
+static void snake_key(EFI_INPUT_KEY key) {
+    CHAR16 ch = key.UnicodeChar;
+    if (gSnakeOver) {
+        if (key.ScanCode == PAC_SCAN_ESC || ch == CHAR_CARRIAGE_RETURN
+            || ch == 'q' || ch == 'Q' || ch == 0x1B) game_quit();
+        return;
+    }
+    int nx = 0, ny = 0, want = 0;
+    switch (key.ScanCode) {
+    case PAC_SCAN_LEFT:  nx = -1; ny =  0; want = 1; break;
+    case PAC_SCAN_RIGHT: nx =  1; ny =  0; want = 1; break;
+    case PAC_SCAN_UP:    nx =  0; ny = -1; want = 1; break;
+    case PAC_SCAN_DOWN:  nx =  0; ny =  1; want = 1; break;
+    case PAC_SCAN_ESC:   game_quit(); return;
+    default: break;
+    }
+    switch (ch) {
+    case 'w': case 'W': nx = 0; ny = -1; want = 1; break;
+    case 's': case 'S': nx = 0; ny =  1; want = 1; break;
+    case 'a': case 'A': nx = -1; ny = 0; want = 1; break;
+    case 'd': case 'D': nx = 1; ny = 0; want = 1; break;
+    case 'q': case 'Q': case 0x1B: game_quit(); return;
+    default: break;
+    }
+    if (want && !(nx == -gSnakeDX && ny == -gSnakeDY)) {   /* no 180-degree turn */
+        gSnakeDX = nx; gSnakeDY = ny;
+        if (!gSnakeStarted) {
+            gSnakeStarted = 1;             /* first steer also starts the game */
+            snake_draw();
+        }
+    }
+}
+
+/* --- XO (Tic-tac-toe) ----------------------------------------------------- */
+
+static int gXoBoard[3][3];
+static int gXoCX, gXoCy;
+static int gXoOver, gXoWinner;           /* 0 none, 1 X, 2 O, 3 draw */
+static int gXoCell, gXoOX, gXoOY;
+static int gXoHuman, gXoAI;
+static UINT32 gXoBg, gXoLine, gXoXCol, gXoOCol, gXoCur, gXoText;
+
+static int xo_win(void) {
+    int b[3][3];
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++) b[y][x] = gXoBoard[y][x];
+    for (int y = 0; y < 3; y++) {
+        if (b[y][0] && b[y][0] == b[y][1] && b[y][1] == b[y][2]) return b[y][0];
+        if (b[0][y] && b[0][y] == b[1][y] && b[1][y] == b[2][y]) return b[0][y];
+    }
+    if (b[0][0] && b[0][0] == b[1][1] && b[1][1] == b[2][2]) return b[0][0];
+    if (b[0][2] && b[0][2] == b[1][1] && b[1][1] == b[2][0]) return b[0][2];
+    return 0;
+}
+
+static int xo_full(void) {
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++)
+            if (gXoBoard[y][x] == XO_EMPTY) return 0;
+    return 1;
+}
+
+static void xo_update_state(void) {
+    int w = xo_win();
+    if (w) { gXoOver = 1; gXoWinner = w; }
+    else if (xo_full()) { gXoOver = 1; gXoWinner = 3; }
+    else { gXoOver = 0; gXoWinner = 0; }
+}
+
+static void xo_draw_mark(int x, int y, int mark, UINT32 col) {
+    int cs = gXoCell;
+    int cx = gXoOX + x * cs, cy = gXoOY + y * cs;
+    int m = cs / 6; if (m < 4) m = 4;
+    int t = cs / 9; if (t < 2) t = 2;
+    if (mark == XO_X) {
+        game_line(cx + m, cy + m, cx + cs - m, cy + cs - m, t, col);
+        game_line(cx + cs - m, cy + m, cx + m, cy + cs - m, t, col);
+    } else {
+        int r = (cs - 2 * m) / 2; if (r < 3) r = 3;
+        pac_fill_circle(cx + cs / 2, cy + cs / 2, r, col);
+        int ir = r - t; if (ir < 1) ir = 1;
+        pac_fill_circle(cx + cs / 2, cy + cs / 2, ir, gXoBg);
+    }
+}
+
+static void xo_draw(void) {
+    int cs = gXoCell;
+    draw_filled_rect(gXoOX, gXoOY, 3 * cs, 3 * cs, gXoBg);
+    for (int i = 1; i <= 2; i++) {
+        draw_filled_rect(gXoOX + i * cs - 2, gXoOY, 4, 3 * cs, gXoLine);
+        draw_filled_rect(gXoOX, gXoOY + i * cs - 2, 3 * cs, 4, gXoLine);
+    }
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++) {
+            if (gXoBoard[y][x] == XO_X) xo_draw_mark(x, y, XO_X, gXoXCol);
+            else if (gXoBoard[y][x] == XO_O) xo_draw_mark(x, y, XO_O, gXoOCol);
+        }
+    if (!gXoOver)
+        draw_rect(gXoOX + gXoCX * cs + 2, gXoOY + gXoCy * cs + 2, cs - 4, cs - 4, gXoCur);
+
+    gui_text(gXoOX, gXoOY - 2 * HRFONT_H, "XO  (You = X, AI = O)", gXoText, gXoBg);
+
+    const char *status;
+    if (gXoOver) {
+        if      (gXoWinner == gXoHuman) status = "YOU WIN!  (Q/ESC = return)";
+        else if (gXoWinner == gXoAI)    status = "AI WINS!  (Q/ESC = return)";
+        else                            status = "DRAW!  (Q/ESC = return)";
+    } else {
+        status = "Arrows = move    Enter = place    Q/ESC = quit";
+    }
+    game_clear_band(gXoOY + 3 * cs + 20, HRFONT_H, gXoBg);
+    gui_text(gXoOX, gXoOY + 3 * cs + 20, status, gXoOver ? gXoCur : gXoText, gXoBg);
+}
+
+static void xo_init(void) {
+    int cell = ((int)gFbHeight - 240) / 3;
+    if (cell * 3 > (int)gFbWidth - 40) cell = ((int)gFbWidth - 40) / 3;
+    if (cell > 180) cell = 180;
+    if (cell < 60) cell = 60;
+    gXoCell = cell;
+    gXoOX = ((int)gFbWidth - 3 * cell) / 2;
+    gXoOY = 200;
+
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 3; x++) gXoBoard[y][x] = XO_EMPTY;
+    gXoCX = 1; gXoCy = 1;
+    gXoOver = 0; gXoWinner = 0;
+    gXoHuman = XO_X; gXoAI = XO_O;
+
+    gXoBg   = fb_make_color(0x12, 0x12, 0x1E);
+    gXoLine = fb_make_color(0x6F, 0xC3, 0xDF);
+    gXoXCol = fb_make_color(0xFF, 0x6B, 0x6B);
+    gXoOCol = fb_make_color(0xFF, 0xE0, 0x66);
+    gXoCur  = fb_make_color(0xFF, 0xFF, 0xFF);
+    gXoText = fb_make_color(0xE6, 0xE6, 0xE6);
+
+    if (mouse_available()) mouse_restore();
+    fb_fill(0, 0, gFbWidth, gFbHeight, gXoBg);
+    xo_draw();
+}
+
+static void xo_ai_move(void) {
+    int y, x;
+    for (y = 0; y < 3; y++)
+        for (x = 0; x < 3; x++)
+            if (gXoBoard[y][x] == XO_EMPTY) {
+                gXoBoard[y][x] = gXoAI;
+                if (xo_win() == gXoAI) return;
+                gXoBoard[y][x] = XO_EMPTY;
+            }
+    for (y = 0; y < 3; y++)
+        for (x = 0; x < 3; x++)
+            if (gXoBoard[y][x] == XO_EMPTY) {
+                gXoBoard[y][x] = gXoHuman;
+                if (xo_win() == gXoHuman) { gXoBoard[y][x] = gXoAI; return; }
+                gXoBoard[y][x] = XO_EMPTY;
+            }
+    if (gXoBoard[1][1] == XO_EMPTY) { gXoBoard[1][1] = gXoAI; return; }
+    static const int corners[4][2] = {{0, 0}, {2, 0}, {0, 2}, {2, 2}};
+    for (int i = 0; i < 4; i++)
+        if (gXoBoard[corners[i][1]][corners[i][0]] == XO_EMPTY) {
+            gXoBoard[corners[i][1]][corners[i][0]] = gXoAI; return;
+        }
+    for (y = 0; y < 3; y++)
+        for (x = 0; x < 3; x++)
+            if (gXoBoard[y][x] == XO_EMPTY) { gXoBoard[y][x] = gXoAI; return; }
+}
+
+static void xo_key(EFI_INPUT_KEY key) {
+    CHAR16 ch = key.UnicodeChar;
+    if (gXoOver) {
+        if (key.ScanCode == PAC_SCAN_ESC || ch == CHAR_CARRIAGE_RETURN
+            || ch == 'q' || ch == 'Q' || ch == 0x1B) game_quit();
+        return;
+    }
+    switch (key.ScanCode) {
+    case PAC_SCAN_LEFT:  if (gXoCX > 0) { gXoCX--; xo_draw(); } return;
+    case PAC_SCAN_RIGHT: if (gXoCX < 2) { gXoCX++; xo_draw(); } return;
+    case PAC_SCAN_UP:    if (gXoCy > 0) { gXoCy--; xo_draw(); } return;
+    case PAC_SCAN_DOWN:  if (gXoCy < 2) { gXoCy++; xo_draw(); } return;
+    case PAC_SCAN_ESC:   game_quit(); return;
+    default: break;
+    }
+    switch (ch) {
+    case 'w': case 'W': if (gXoCy > 0) { gXoCy--; xo_draw(); } return;
+    case 's': case 'S': if (gXoCy < 2) { gXoCy++; xo_draw(); } return;
+    case 'a': case 'A': if (gXoCX > 0) { gXoCX--; xo_draw(); } return;
+    case 'd': case 'D': if (gXoCX < 2) { gXoCX++; xo_draw(); } return;
+    case 'q': case 'Q': case 0x1B: game_quit(); return;
+    default: break;
+    }
+    if (ch == CHAR_CARRIAGE_RETURN || ch == ' ') {
+        if (gXoBoard[gXoCy][gXoCX] == XO_EMPTY) {
+            gXoBoard[gXoCy][gXoCX] = gXoHuman;
+            xo_update_state();
+            xo_draw();
+            if (!gXoOver) {
+                uefi_call_wrapper(BS->Stall, 1, 250000);   /* brief "thinking" */
+                xo_ai_move();
+                xo_update_state();
+                xo_draw();
+            }
+        }
+        return;
+    }
+}
+
+/* --- Pong (ปอง) ----------------------------------------------------------- */
+
+static int gPongTop, gPongBot, gPongLeft, gPongRight;
+static int gPongLX, gPongRX, gPongLY, gPongRY;
+static int gPongBX, gPongBY, gPongVX, gPongVY;
+static int gPongLScore, gPongRScore, gPongOver;
+static int gPongMove, gPongMoveTicks;
+static UINT32 gPongBg, gPongNet, gPongLPad, gPongRPad, gPongBall, gPongText;
+
+static void pong_draw_paddle(int x, int y, UINT32 c) {
+    draw_filled_rect(x, y, PONG_PAD_W, PONG_PAD_H, c);
+}
+
+static void pong_draw_field(void) {
+    int cx = (gPongLeft + gPongRight) / 2;
+    for (int y = gPongTop + 8; y < gPongBot - 8; y += 30)
+        draw_filled_rect(cx - 2, y, 4, 16, gPongNet);
+}
+
+static void pong_draw(void) {
+    draw_filled_rect(gPongLeft, gPongTop, gPongRight - gPongLeft, gPongBot - gPongTop, gPongBg);
+    pong_draw_field();
+    pong_draw_paddle(gPongLX, gPongLY, gPongLPad);
+    pong_draw_paddle(gPongRX, gPongRY, gPongRPad);
+    draw_filled_rect(gPongBX, gPongBY, PONG_BALL, PONG_BALL, gPongBall);
+
+    char buf[32]; int n = 0;
+    gui_itoa(gPongLScore, buf); while (buf[n]) n++;
+    buf[n++] = ' '; buf[n++] = ':'; buf[n++] = ' ';
+    gui_itoa(gPongRScore, buf + n); while (buf[n]) n++;
+    buf[n] = '\0';
+    int sw = gui_text_cells(buf) * HRFONT_W;
+    gui_text(((int)gFbWidth - sw) / 2, gPongTop - 2 * HRFONT_H, buf, gPongText, gPongBg);
+
+    const char *line;
+    if (gPongOver)
+        line = (gPongLScore > gPongRScore) ? "YOU WIN!  (Q/ESC = return)"
+                                           : "AI WINS!  (Q/ESC = return)";
+    else
+        line = "W/S or Up/Down = move    Q/ESC = quit";
+    int lw = gui_text_cells(line) * HRFONT_W;
+    game_clear_band(gPongBot + 20, HRFONT_H, gPongBg);
+    gui_text((int)(gFbWidth - lw) / 2, gPongBot + 20, line,
+             gPongOver ? gPongBall : gPongText, gPongBg);
+}
+
+static void pong_init(void) {
+    gPongTop   = 150;
+    gPongBot   = (int)gFbHeight - 60;
+    gPongLeft  = 40;
+    gPongRight = (int)gFbWidth - 40;
+    gPongLX = gPongLeft + 24;
+    gPongRX = gPongRight - 24 - PONG_PAD_W;
+    gPongLY = (gPongTop + gPongBot) / 2 - PONG_PAD_H / 2;
+    gPongRY = gPongLY;
+    gPongBX = (gPongLeft + gPongRight) / 2 - PONG_BALL / 2;
+    gPongBY = (gPongTop + gPongBot) / 2 - PONG_BALL / 2;
+    gPongVX = 4; gPongVY = 3;
+    gPongLScore = 0; gPongRScore = 0; gPongOver = 0;
+    gPongMove = 0; gPongMoveTicks = 0;
+
+    gPongBg   = fb_make_color(0x08, 0x0C, 0x10);
+    gPongNet  = fb_make_color(0x2E, 0x3A, 0x4A);
+    gPongLPad = fb_make_color(0x6F, 0xC3, 0xDF);
+    gPongRPad = fb_make_color(0xFF, 0x6B, 0x6B);
+    gPongBall = fb_make_color(0xFF, 0xFF, 0xFF);
+    gPongText = fb_make_color(0xE6, 0xE6, 0xE6);
+
+    if (mouse_available()) mouse_restore();
+    fb_fill(0, 0, gFbWidth, gFbHeight, gPongBg);
+    pong_draw();
+}
+
+static void pong_tick(void) {
+    if (gPongOver) return;
+
+    /* erase the moving objects, then repaint the net over any gap left behind */
+    draw_filled_rect(gPongBX, gPongBY, PONG_BALL, PONG_BALL, gPongBg);
+    draw_filled_rect(gPongLX, gPongLY, PONG_PAD_W, PONG_PAD_H, gPongBg);
+    draw_filled_rect(gPongRX, gPongRY, PONG_PAD_W, PONG_PAD_H, gPongBg);
+    pong_draw_field();
+
+    /* player paddle follows the momentum left by recent key presses */
+    if (gPongMoveTicks > 0) {
+        gPongLY += gPongMove * PONG_PAD_STEP;
+        gPongMoveTicks--;
+    }
+    if (gPongLY < gPongTop) gPongLY = gPongTop;
+    if (gPongLY + PONG_PAD_H > gPongBot) gPongLY = gPongBot - PONG_PAD_H;
+
+    /* AI paddle tracks the ball */
+    int target = gPongBY + PONG_BALL / 2 - PONG_PAD_H / 2;
+    if (gPongRY < target) { gPongRY += 7; if (gPongRY > target) gPongRY = target; }
+    else if (gPongRY > target) { gPongRY -= 7; if (gPongRY < target) gPongRY = target; }
+    if (gPongRY < gPongTop) gPongRY = gPongTop;
+    if (gPongRY + PONG_PAD_H > gPongBot) gPongRY = gPongBot - PONG_PAD_H;
+
+    gPongBX += gPongVX;
+    gPongBY += gPongVY;
+
+    if (gPongBY < gPongTop) { gPongBY = gPongTop; gPongVY = -gPongVY; }
+    if (gPongBY + PONG_BALL > gPongBot) { gPongBY = gPongBot - PONG_BALL; gPongVY = -gPongVY; }
+
+    if (gPongVX < 0 && gPongBX <= gPongLX + PONG_PAD_W
+        && gPongBX + PONG_BALL >= gPongLX
+        && gPongBY + PONG_BALL >= gPongLY && gPongBY <= gPongLY + PONG_PAD_H) {
+        int mag = pac_abs(gPongVX) + 1; if (mag > 10) mag = 10;
+        int off = (gPongBY + PONG_BALL / 2) - (gPongLY + PONG_PAD_H / 2);
+        int vy = off / 7; if (vy == 0) vy = 1;
+        gPongBX = gPongLX + PONG_PAD_W;
+        gPongVX = mag; gPongVY = vy;
+    }
+    if (gPongVX > 0 && gPongBX + PONG_BALL >= gPongRX
+        && gPongBX <= gPongRX + PONG_PAD_W
+        && gPongBY + PONG_BALL >= gPongRY && gPongBY <= gPongRY + PONG_PAD_H) {
+        int mag = pac_abs(gPongVX) + 1; if (mag > 10) mag = 10;
+        int off = (gPongBY + PONG_BALL / 2) - (gPongRY + PONG_PAD_H / 2);
+        int vy = off / 7; if (vy == 0) vy = 1;
+        gPongBX = gPongRX - PONG_BALL;
+        gPongVX = -mag; gPongVY = vy;
+    }
+
+    int scored = 0, serve = 0;
+    if (gPongBX < gPongLeft) { gPongRScore++; scored = 1; serve = -1; }
+    else if (gPongBX + PONG_BALL > gPongRight) { gPongLScore++; scored = 1; serve = 1; }
+
+    if (scored) {
+        if (gPongLScore >= 5 || gPongRScore >= 5) gPongOver = 1;
+        gPongBX = (gPongLeft + gPongRight) / 2 - PONG_BALL / 2;
+        gPongBY = (gPongTop + gPongBot) / 2 - PONG_BALL / 2;
+        gPongVX = serve * 4; gPongVY = 3;
+        pong_draw();
+        return;
+    }
+
+    pong_draw_paddle(gPongLX, gPongLY, gPongLPad);
+    pong_draw_paddle(gPongRX, gPongRY, gPongRPad);
+    draw_filled_rect(gPongBX, gPongBY, PONG_BALL, PONG_BALL, gPongBall);
+}
+
+static void pong_key(EFI_INPUT_KEY key) {
+    CHAR16 ch = key.UnicodeChar;
+    if (gPongOver) {
+        if (key.ScanCode == PAC_SCAN_ESC || ch == CHAR_CARRIAGE_RETURN
+            || ch == 'q' || ch == 'Q' || ch == 0x1B) game_quit();
+        return;
+    }
+    int dir = 0;
+    switch (key.ScanCode) {
+    case PAC_SCAN_UP:   dir = -1; break;
+    case PAC_SCAN_DOWN: dir =  1; break;
+    case PAC_SCAN_ESC:  game_quit(); return;
+    default: break;
+    }
+    switch (ch) {
+    case 'w': case 'W': dir = -1; break;
+    case 's': case 'S': dir =  1; break;
+    case 'q': case 'Q': case 0x1B: game_quit(); return;
+    default: break;
+    }
+    if (dir) { gPongMove = dir; gPongMoveTicks = PONG_HOLD_TICKS; }
+}
+
+/* --- Tetris (ต่อบล็อก) ---------------------------------------------------- */
+
+static int gTetBoard[TET_H][TET_W];      /* 0 empty, 1..7 = colour index */
+static int gTetType, gTetRot, gTetX, gTetY;
+static int gTetLevel, gTetScore, gTetLines, gTetOver;
+static int gTetOX, gTetOY, gTetCell;
+static UINT32 gTetBg, gTetGrid, gTetColors[8], gTetText;
+static unsigned long long gTetRng;
+
+static UINT16 tet_rot_mask(UINT16 m) {
+    UINT16 r = 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            if (m & (1u << (y * 4 + x)))
+                r |= 1u << (x * 4 + (3 - y));
+    return r;
+}
+
+static UINT16 tet_shape(int type, int rot) {
+    static const UINT16 base[7] = { 0x00F0, 0x0066, 0x0072, 0x0036, 0x0063, 0x0071, 0x0074 };
+    UINT16 m = base[type];
+    for (int i = 0; i < rot; i++) m = tet_rot_mask(m);
+    return m;
+}
+
+static int tet_collides(int type, int rot, int x, int y) {
+    UINT16 m = tet_shape(type, rot);
+    for (int by = 0; by < 4; by++)
+        for (int bx = 0; bx < 4; bx++) {
+            if (!(m & (1u << (by * 4 + bx)))) continue;
+            int cx = x + bx, cy = y + by;
+            if (cx < 0 || cx >= TET_W) return 1;
+            if (cy >= TET_H) return 1;
+            if (cy >= 0 && gTetBoard[cy][cx] != 0) return 1;
+        }
+    return 0;
+}
+
+static void tet_draw_cell(int x, int y, UINT32 c) {
+    int cs = gTetCell;
+    draw_filled_rect(gTetOX + x * cs + 1, gTetOY + y * cs + 1, cs - 2, cs - 2, c);
+}
+
+static void tet_draw(void) {
+    int cs = gTetCell;
+    draw_filled_rect(gTetOX, gTetOY, TET_W * cs, TET_H * cs, gTetBg);
+    draw_rect(gTetOX, gTetOY, TET_W * cs, TET_H * cs, gTetGrid);
+
+    for (int y = 0; y < TET_H; y++)
+        for (int x = 0; x < TET_W; x++)
+            if (gTetBoard[y][x]) tet_draw_cell(x, y, gTetColors[gTetBoard[y][x]]);
+
+    if (!gTetOver) {
+        UINT16 m = tet_shape(gTetType, gTetRot);
+        for (int by = 0; by < 4; by++)
+            for (int bx = 0; bx < 4; bx++)
+                if (m & (1u << (by * 4 + bx))) {
+                    int cx = gTetX + bx, cy = gTetY + by;
+                    if (cy >= 0 && cy < TET_H && cx >= 0 && cx < TET_W)
+                        tet_draw_cell(cx, cy, gTetColors[gTetType + 1]);
+                }
+    }
+
+    char buf[64]; int n = 0; const char *p;
+    int hx = gTetOX + TET_W * cs + 40;
+    for (p = "SCORE "; *p; p++) buf[n++] = *p;
+    gui_itoa(gTetScore, buf + n); while (buf[n]) n++;
+    buf[n] = '\0'; gui_text(hx, gTetOY, buf, gTetText, gTetBg);
+    n = 0;
+    for (p = "LINES "; *p; p++) buf[n++] = *p;
+    gui_itoa(gTetLines, buf + n); while (buf[n]) n++;
+    buf[n] = '\0'; gui_text(hx, gTetOY + HRFONT_H, buf, gTetText, gTetBg);
+    n = 0;
+    for (p = "LEVEL "; *p; p++) buf[n++] = *p;
+    gui_itoa(gTetLevel + 1, buf + n); while (buf[n]) n++;
+    buf[n] = '\0'; gui_text(hx, gTetOY + 2 * HRFONT_H, buf, gTetText, gTetBg);
+
+    const char *hint = gTetOver
+        ? "GAME OVER  (Q/ESC = return)"
+        : "Arrows move  Up=rotate  Down=drop  Space=hard drop  Q/ESC=quit";
+    game_clear_band(gTetOY + TET_H * cs + 20, HRFONT_H, gTetBg);
+    gui_text(gTetOX, gTetOY + TET_H * cs + 20, hint, gTetOver ? gTetColors[2] : gTetText, gTetBg);
+}
+
+static void tet_lock(void) {
+    UINT16 m = tet_shape(gTetType, gTetRot);
+    for (int by = 0; by < 4; by++)
+        for (int bx = 0; bx < 4; bx++)
+            if (m & (1u << (by * 4 + bx))) {
+                int cx = gTetX + bx, cy = gTetY + by;
+                if (cy >= 0 && cy < TET_H && cx >= 0 && cx < TET_W)
+                    gTetBoard[cy][cx] = gTetType + 1;
+            }
+
+    int cleared = 0;
+    for (int y = TET_H - 1; y >= 0; y--) {
+        int full = 1;
+        for (int x = 0; x < TET_W; x++)
+            if (gTetBoard[y][x] == 0) { full = 0; break; }
+        if (full) {
+            for (int yy = y; yy > 0; yy--)
+                for (int x = 0; x < TET_W; x++)
+                    gTetBoard[yy][x] = gTetBoard[yy - 1][x];
+            for (int x = 0; x < TET_W; x++) gTetBoard[0][x] = 0;
+            cleared++;
+            y++;
+        }
+    }
+    if (cleared) {
+        static const int pts[5] = { 0, 100, 300, 500, 800 };
+        gTetScore += pts[cleared];
+        gTetLines += cleared;
+        gTetLevel = gTetLines / 10;
+        gTetFallUs = TET_FALL_BASE - gTetLevel * 40000;
+        if (gTetFallUs < TET_FALL_MIN) gTetFallUs = TET_FALL_MIN;
+    }
+
+    gTetType = (int)(random_u32(&gTetRng) % 7);
+    gTetRot = 0;
+    gTetX = (TET_W - 4) / 2;
+    gTetY = 0;
+    if (tet_collides(gTetType, gTetRot, gTetX, gTetY)) gTetOver = 1;
+}
+
+static void tet_try_move(int dx, int dy) {
+    if (!tet_collides(gTetType, gTetRot, gTetX + dx, gTetY + dy)) {
+        gTetX += dx; gTetY += dy;
+        tet_draw();
+    }
+}
+
+static void tet_try_rotate(void) {
+    int nr = (gTetRot + 1) & 3;
+    if (!tet_collides(gTetType, nr, gTetX, gTetY)) {
+        gTetRot = nr;
+        tet_draw();
+    }
+}
+
+static void tet_soft_drop(void) {
+    if (!tet_collides(gTetType, gTetRot, gTetX, gTetY + 1)) {
+        gTetY++;
+        gTetScore += 1;
+    } else {
+        tet_lock();
+    }
+    tet_draw();
+}
+
+static void tet_hard_drop(void) {
+    while (!tet_collides(gTetType, gTetRot, gTetX, gTetY + 1)) {
+        gTetY++;
+        gTetScore += 2;
+    }
+    tet_lock();
+    tet_draw();
+}
+
+static void tet_tick(void) {
+    if (gTetOver) return;
+    if (!tet_collides(gTetType, gTetRot, gTetX, gTetY + 1)) {
+        gTetY++;
+    } else {
+        tet_lock();
+    }
+    tet_draw();
+}
+
+static void tet_init(void) {
+    gTetOY = 150;
+    int cell = ((int)gFbHeight - gTetOY - 70) / TET_H;
+    if (cell > 34) cell = 34;
+    if (cell < 18) cell = 18;
+    gTetCell = cell;
+    gTetOX = ((int)gFbWidth - TET_W * cell) / 2;
+
+    for (int y = 0; y < TET_H; y++)
+        for (int x = 0; x < TET_W; x++) gTetBoard[y][x] = 0;
+
+    gTetLevel = 0; gTetScore = 0; gTetLines = 0; gTetOver = 0;
+    gTetFallUs = TET_FALL_BASE;
+    gTetRng = (time_in_ms() * 0x9E3779B97F4A7C15ULL) | 1;
+    gTetType = (int)(random_u32(&gTetRng) % 7);
+    gTetRot = 0;
+    gTetX = (TET_W - 4) / 2;
+    gTetY = 0;
+
+    gTetBg   = fb_make_color(0x0A, 0x0A, 0x12);
+    gTetGrid = fb_make_color(0x2E, 0x3A, 0x4A);
+    gTetColors[0] = gTetBg;
+    gTetColors[1] = fb_make_color(0x3B, 0xE0, 0xE0);
+    gTetColors[2] = fb_make_color(0xFF, 0xD8, 0x00);
+    gTetColors[3] = fb_make_color(0xB0, 0x6B, 0xFF);
+    gTetColors[4] = fb_make_color(0x3B, 0xFF, 0x8A);
+    gTetColors[5] = fb_make_color(0xFF, 0x4B, 0x4B);
+    gTetColors[6] = fb_make_color(0x4B, 0x8B, 0xFF);
+    gTetColors[7] = fb_make_color(0xFF, 0xA0, 0x4B);
+    gTetText = fb_make_color(0xE6, 0xE6, 0xE6);
+
+    if (mouse_available()) mouse_restore();
+    fb_fill(0, 0, gFbWidth, gFbHeight, gTetBg);
+    tet_draw();
+}
+
+static void tet_key(EFI_INPUT_KEY key) {
+    CHAR16 ch = key.UnicodeChar;
+    if (gTetOver) {
+        if (key.ScanCode == PAC_SCAN_ESC || ch == CHAR_CARRIAGE_RETURN
+            || ch == 'q' || ch == 'Q' || ch == 0x1B) game_quit();
+        return;
+    }
+    switch (key.ScanCode) {
+    case PAC_SCAN_LEFT:  tet_try_move(-1, 0); return;
+    case PAC_SCAN_RIGHT: tet_try_move(1, 0); return;
+    case PAC_SCAN_DOWN:  tet_soft_drop(); return;
+    case PAC_SCAN_UP:    tet_try_rotate(); return;
+    case PAC_SCAN_ESC:   game_quit(); return;
+    default: break;
+    }
+    switch (ch) {
+    case 'a': case 'A': tet_try_move(-1, 0); return;
+    case 'd': case 'D': tet_try_move(1, 0); return;
+    case 's': case 'S': tet_soft_drop(); return;
+    case 'w': case 'W': tet_try_rotate(); return;
+    case ' ':           tet_hard_drop(); return;
+    case 'q': case 'Q': case 0x1B: game_quit(); return;
+    default: break;
+    }
+}
+
+/* --- Shared dispatch (driven by gui_run()'s game loop and the picker) ------ */
+
+static void gui_game_key(EFI_INPUT_KEY key) {
+    switch (gGameMode) {
+    case GAME_MODE_PACMAN: pac_key(key);    break;
+    case GAME_MODE_SNAKE:  snake_key(key);  break;
+    case GAME_MODE_XO:     xo_key(key);     break;
+    case GAME_MODE_PONG:   pong_key(key);   break;
+    case GAME_MODE_TETRIS: tet_key(key); break;
+    default: break;
+    }
+}
+
+static void gui_game_tick(void) {
+    switch (gGameMode) {
+    case GAME_MODE_PACMAN: pac_tick();    break;
+    case GAME_MODE_SNAKE:  snake_tick();  break;
+    case GAME_MODE_XO:     break;         /* turn-based */
+    case GAME_MODE_PONG:   pong_tick();   break;
+    case GAME_MODE_TETRIS: tet_tick(); break;
+    default: break;
+    }
+}
+
+static int gui_game_tick_us(void) {
+    switch (gGameMode) {
+    case GAME_MODE_PACMAN: return PAC_TICK_US;
+    case GAME_MODE_SNAKE:  return SNAKE_TICK_US;
+    case GAME_MODE_XO:     return 0;
+    case GAME_MODE_PONG:   return PONG_TICK_US;
+    case GAME_MODE_TETRIS: return gTetFallUs;
+    default: return 0;
+    }
+}
+
+/* Start game #idx (0 = Pac-Man, 1 = Snake, ... matching gGameLabels). */
+static void gui_start_game(int idx) {
+    gGameAccum = 0;
+    switch (idx) {
+    case 0: gGameMode = GAME_MODE_PACMAN; pac_init();    break;
+    case 1: gGameMode = GAME_MODE_SNAKE;  snake_init();  break;
+    case 2: gGameMode = GAME_MODE_XO;     xo_init();     break;
+    case 3: gGameMode = GAME_MODE_PONG;   pong_init();   break;
+    case 4: gGameMode = GAME_MODE_TETRIS; tet_init(); break;
+    default: gGameMode = GAME_MODE_NONE; return;
+    }
+}
+
+/* Open the drop-down that lists every game for up/down + Enter selection. */
+static void gui_open_game_picker(void) {
+    gPickerKind  = PICKER_GAME;
+    gPickerTitle = "เลือกเกม (Enter=เลือก, Esc=ยกเลิก)";
+    gPickerCount = GAME_COUNT;
+    for (int i = 0; i < gPickerCount; i++) {
+        int n = 0;
+        for (const char *p = gGameLabels[i]; *p && n < 63; p++)
+            gPickerNames[i][n++] = *p;
+        gPickerNames[i][n] = '\0';
+    }
+    gPickerSel = 0;
+    gPickerOn  = 1;
+    if (mouse_available()) mouse_restore();
+    gui_draw_picker();
+}
+
 static void process_slash_command(char *input) {
     if (input[0] != '/') return;
 
@@ -3700,13 +4742,19 @@ static void process_slash_command(char *input) {
         gui_chat_add(">   /clear           clear this chat");
         gui_chat_add(">   /help            show this list");
         gui_chat_add(">   /loadmodel FILE  load a model checkpoint");
+        gui_chat_add(">   /loadmodel       pick a model (up/down + Enter)");
         gui_chat_add(">   /listmodel       list available models");
         gui_chat_add(">   /train           enter training mode");
+        gui_chat_add(">   /games           pick a game (up/down + Enter)");
         gui_chat_add(">   /games pacman    play Pacman (classic map)");
         gui_chat_add(">   /games pacman auto   Pacman, AI plays itself");
+        gui_chat_add(">   /games snake     Snake (งูกินหาง)");
+        gui_chat_add(">   /games xo        XO / Tic-tac-toe");
+        gui_chat_add(">   /games pong      Pong (ปอง)");
+        gui_chat_add(">   /games tetris    Tetris (ต่อบล็อก)");
     } else if (strcmp(cmd, "loadmodel") == 0) {
         if (arg && *arg) load_new_model(arg);
-        else             gui_chat_add("> usage: /loadmodel <filename>");
+        else             gui_open_model_picker();   /* no arg -> drop-down list */
     } else if (strcmp(cmd, "listmodel") == 0) {
         char names[16][64];
         int cnt = list_model_files(names, 16);
@@ -3720,19 +4768,56 @@ static void process_slash_command(char *input) {
         gTrainingMode = 1;
         gui_chat_add("> training mode ON (placeholder)");
     } else if (strcmp(cmd, "games") == 0) {
-        if (arg && strncmp(arg, "pacman", 6) == 0) {
-            /* optional trailing "auto" -> AI plays by itself */
+        if (!arg || !*arg) {
+            gui_open_game_picker();       /* no arg -> drop-down to pick a game */
+        } else if (strncmp(arg, "pacman", 6) == 0) {
+            gui_start_game(0);
             const char *rest = arg + 6;
             while (*rest == ' ') rest++;
-            gPacAuto = (strncmp(rest, "auto", 4) == 0) ? 1 : 0;
-            gGameMode = GAME_MODE_PACMAN;
-            pac_init();
+            if (strncmp(rest, "auto", 4) == 0) { gPacAuto = 1; pac_draw_hud(); }
+        } else if (strncmp(arg, "snake", 5) == 0) {
+            gui_start_game(1);
+        } else if (strncmp(arg, "xo", 2) == 0 || strncmp(arg, "tic", 3) == 0) {
+            gui_start_game(2);
+        } else if (strncmp(arg, "pong", 4) == 0) {
+            gui_start_game(3);
+        } else if (strncmp(arg, "tetris", 6) == 0) {
+            gui_start_game(4);
         } else {
-            gui_chat_add("> usage: /games pacman [auto]");
+            gui_chat_add("> usage: /games [pacman|snake|xo|pong|tetris]");
         }
     } else {
         gui_chat_add2("> unknown command: /", cmd);
     }
+}
+
+/* True when `s` normalises to the Thai greeting "สวัสดี" (or the common
+ * misspelling "สวัดดี"), ignoring whitespace the same way kb_lookup() does. */
+static int gui_is_greeting(const char *s) {
+    static const UINT32 sawatdee[] = { 0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35 };
+    static const UINT32 sawaddee[] = { 0x0E2A, 0x0E27, 0x0E31, 0x0E14, 0x0E35 };
+    UINT32 got[KB_MAX_Q];
+    int n = utf8_norm(s, got, KB_MAX_Q);
+    const UINT32 *want; int wn;
+    if      (n == 6) { want = sawatdee; wn = 6; }
+    else if (n == 5) { want = sawaddee; wn = 5; }
+    else return 0;
+    for (int i = 0; i < wn; i++)
+        if (got[i] != want[i]) return 0;
+    return 1;
+}
+
+/* On-screen Thai usage guide (คู่มือวิธีใช้), appended after the greeting. */
+static void gui_chat_show_usage(void) {
+    gui_chat_add("คู่มือวิธีใช้:");
+    gui_chat_add("> F1 สลับพิมพ์ภาษาไทย / อังกฤษ");
+    gui_chat_add("> พิมพ์คำถาม แล้วกด Enter เพื่อถาม AI");
+    gui_chat_add("> จำไว้: คำถาม = คำตอบ  เพื่อสอนความรู้ใหม่");
+    gui_chat_add("> /games pacman  เล่นเกมแพคแมน");
+    gui_chat_add("> /help  แสดงคำสั่งทั้งหมด");
+    gui_chat_add("> /clear  ล้างข้อความบนจอ");
+    gui_chat_add("> /reboot  รีสตาร์ตเครื่อง");
+    gui_chat_add("> /shutdown  ปิดเครื่อง");
 }
 
 static void gui_send(void) {
@@ -3753,6 +4838,12 @@ static void gui_send(void) {
             kb_remember(gRoot, gInputBuf + strlen("จำไว้"));   /* teach a new fact */
             uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
             gui_chat_add("จำไว้แล้ว");
+            gui_set_emotion(EMOTION_HAPPY);
+        } else if (gui_is_greeting(gInputBuf)) {
+            /* "สวัสดี" -> polite Thai greeting + on-screen usage guide. */
+            uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
+            gui_chat_add("สวัสดีครับ ผมเป็นเอไอภาษาไทย");
+            gui_chat_show_usage();
             gui_set_emotion(EMOTION_HAPPY);
         } else {
             int ki = kb_lookup(gInputBuf);                     /* answer from KB   */
@@ -3780,7 +4871,7 @@ static void gui_send(void) {
 
     gInputLen = 0;
     gInputBuf[0] = '\0';
-    if (gGameMode == GAME_MODE_NONE)
+    if (gGameMode == GAME_MODE_NONE && !gPickerOn)
         gui_repaint_chat();   /* also repaints the now-empty input box */
 }
 
@@ -3794,6 +4885,9 @@ static void gui_click(int mx, int my) {
  * ------------------------------------------------------------------------- */
 
 static void gui_handle_key(EFI_INPUT_KEY key) {
+    /* The model-picker drop-down owns every key while it is showing. */
+    if (gPickerOn) { gui_picker_key(key); return; }
+
     gui_caret_reset();   /* any key wakes the caret back to solid */
 
     if (key.ScanCode == KBD_SCAN_F1) {
@@ -3981,15 +5075,18 @@ static void screensaver_exit(void) {
 static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
     gRoot = root;
     for (;;) {
-        /* Pacman mode: run the game instead of the chat loop. */
-        if (gGameMode == GAME_MODE_PACMAN) {
+        /* Game mode: run the active game instead of the chat loop. */
+        if (gGameMode != GAME_MODE_NONE) {
             EFI_INPUT_KEY key;
             EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
-            if (ks == EFI_SUCCESS) pac_key(key);
-            gPacAccum += GUI_POLL_US;
-            if (gPacAccum >= PAC_TICK_US) {
-                gPacAccum -= PAC_TICK_US;
-                pac_tick();
+            if (ks == EFI_SUCCESS) gui_game_key(key);
+            int tick_us = gui_game_tick_us();
+            if (tick_us > 0) {
+                gGameAccum += GUI_POLL_US;
+                if (gGameAccum >= tick_us) {
+                    gGameAccum -= tick_us;
+                    gui_game_tick();
+                }
             }
             uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
             continue;
@@ -4020,6 +5117,17 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
         }
 
         if (key_activity) { gui_handle_key(key); gIdleUs = 0; }
+
+        /* A key may have started a game (e.g. Enter on the /games picker): hand
+         * straight to the game loop so the chat caret/mouse don't paint over it. */
+        if (gGameMode != GAME_MODE_NONE) continue;
+
+        /* While the model picker is up it owns the whole screen: skip mouse
+         * polling, caret blink and the screensaver timer until it closes. */
+        if (gPickerOn) {
+            uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            continue;
+        }
 
         /* 2. mouse: poll relative movement and button clicks */
         if (gui_poll_mouse()) gIdleUs = 0;
