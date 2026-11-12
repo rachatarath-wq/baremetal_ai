@@ -3422,6 +3422,27 @@ static void pac_move_pacman(void) {
     }
 }
 
+/* Per-ghost chase target.  Each ghost homes on a different spot so the four
+ * spread out instead of stacking on the same shortest path to Pacman:
+ *   Blinky -> Pacman's tile,   Pinky -> 4 tiles ahead of Pacman,
+ *   Inky   -> 2 tiles behind,  Clyde -> chases only while far away, otherwise
+ *                                        retreats to his bottom-left corner. */
+static void pac_ghost_target(int i, int *tx, int *ty) {
+    int dx = gPacDirX, dy = gPacDirY;
+    if (dx == 0 && dy == 0) { dx = 1; dy = 0; }
+    switch (i) {
+    case 0:  *tx = gPacX; *ty = gPacY; break;                          /* Blinky */
+    case 1:  *tx = pac_wrap_x(gPacX + dx * 4); *ty = gPacY + dy * 4; break; /* Pinky */
+    case 2:  *tx = pac_wrap_x(gPacX - dx * 2); *ty = gPacY - dy * 2; break; /* Inky  */
+    default:                                                           /* Clyde */
+        if (pac_abs(gPacX - gPacGhostX[i]) + pac_abs(gPacY - gPacGhostY[i]) >= 8)
+            { *tx = gPacX; *ty = gPacY; }
+        else
+            { *tx = 1; *ty = PAC_H - 2; }                              /* corner  */
+        break;
+    }
+}
+
 static void pac_move_ghost(int i) {
     static const int cd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     int x = gPacGhostX[i], y = gPacGhostY[i];
@@ -3432,19 +3453,42 @@ static void pac_move_ghost(int i) {
         : (x >= PAC_HOUSE_X0 && x <= PAC_HOUSE_X1
         && y >= PAC_HOUSE_Y0 && y <= PAC_HOUSE_Y1);
 
+    if (trapped) {
+        /* Deterministic escape: slide sideways to the door column, then climb
+         * straight up and out.  (A greedy chase target is unreliable here — the
+         * straight-line bonus makes ghosts oscillate left/right inside the house
+         * forever instead of going up through the door.) */
+        int dx = 0, dy = 0;
+        if      (x < PAC_DOOR_X0) { dx =  1; dy =  0; }   /* right toward door   */
+        else if (x > PAC_DOOR_X1) { dx = -1; dy =  0; }   /* left  toward door   */
+        else                      { dx =  0; dy = -1; }   /* up, through the door */
+        int nx = pac_wrap_x(x + dx), ny = y + dy;
+        if (pac_ghost_blocked(nx, ny, 1)) {              /* fallback: any exit   */
+            dx = 0; dy = 0;
+            for (int k = 0; k < 4; k++) {
+                int fx = pac_wrap_x(x + cd[k][0]), fy = y + cd[k][1];
+                if (!pac_ghost_blocked(fx, fy, 1)) { dx = cd[k][0]; dy = cd[k][1]; break; }
+            }
+        }
+        gPacGhostDX[i] = dx;
+        gPacGhostDY[i] = dy;
+        gPacGhostX[i] = pac_wrap_x(x + dx);
+        gPacGhostY[i] = y + dy;
+        return;
+    }
+
     int tx, ty;
-    if (trapped)      { tx = PAC_DOOR_X0; ty = PAC_DOOR_Y - 1; }  /* escape */
-    else              { tx = gPacX;       ty = gPacY; }           /* chase   */
+    pac_ghost_target(i, &tx, &ty);                          /* chase   */
 
     int best = -1, bestscore = -1000000000;
     for (int k = 0; k < 4; k++) {
         int nx = x + cd[k][0], ny = y + cd[k][1];
-        if (pac_ghost_blocked(nx, ny, trapped)) continue;
-        if (!trapped && nx == x - gPacGhostDX[i] && ny == y - gPacGhostDY[i])
-            continue;                                           /* no U-turn   */
+        if (pac_ghost_blocked(nx, ny, 0)) continue;
+        if (nx == x - gPacGhostDX[i] && ny == y - gPacGhostDY[i])
+            continue;                                       /* no U-turn   */
         int score;
-        if (gPacFright && !trapped)
-            score = (nx * 7 + ny * 13) % 4;                     /* scatter     */
+        if (gPacFright)
+            score = (nx * 7 + ny * 13) % 4;                 /* scatter     */
         else
             score = 1000 - (pac_abs(pac_wrap_x(nx) - tx) + pac_abs(ny - ty));
         if (cd[k][0] == gPacGhostDX[i] && cd[k][1] == gPacGhostDY[i]) score += 50;
@@ -3452,12 +3496,12 @@ static void pac_move_ghost(int i) {
     }
     if (best < 0) {                             /* only a U-turn is possible */
         for (int k = 0; k < 4; k++) {
-            if (!pac_ghost_blocked(x + cd[k][0], y + cd[k][1], trapped)) {
+            if (!pac_ghost_blocked(x + cd[k][0], y + cd[k][1], 0)) {
                 best = k; break;
             }
         }
     }
-    if (best < 0) return;                       /* trapped (should not happen) */
+    if (best < 0) return;                       /* fully boxed in (rare) */
     gPacGhostDX[i] = cd[best][0];
     gPacGhostDY[i] = cd[best][1];
     gPacGhostX[i] = pac_wrap_x(x + cd[best][0]);
