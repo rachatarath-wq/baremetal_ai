@@ -2351,6 +2351,11 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 #define EMOTION_HOLD_LOOPS 250   /* answer mood -> idle after ~2.5 s (10ms ticks) */
 #define GUI_GEN_STEPS      128   /* max tokens the model generates per answer    */
 
+/* Screensaver: after 30 min with no keyboard/mouse input, blank the desktop and
+ * bounce a logo until the next input wakes it (that first input is swallowed). */
+#define SCREENSAVER_IDLE_US   1800000000ULL  /* 30 minutes, in microseconds       */
+#define SCREENSAVER_MOVE_US     33000        /* ~30 fps bounce animation          */
+
 typedef struct { int x, y, w, h; } GuiRect;
 
 /* The AI's on-screen mood: drawn as a face + Thai caption in the top-right. */
@@ -2397,6 +2402,14 @@ static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() *
 #define GAME_MODE_NONE   0
 #define GAME_MODE_PACMAN 1
 static int gGameMode = GAME_MODE_NONE;
+
+/* screensaver state (chat desktop) */
+static UINT64 gIdleUs = 0;         /* microseconds since the last input         */
+static int    gSaverOn = 0;        /* 1 = screensaver is showing                */
+static int    gSaverX, gSaverY;    /* bouncing logo top-left, px                */
+static int    gSaverDX = 4, gSaverDY = 3;  /* bounce direction, px per step     */
+static UINT64 gSaverAccumUs = 0;   /* animation accumulator                     */
+static UINT32 gSaverBg, gSaverFg, gSaverDim;
 
 /* --- live model state: built at boot by efi_main, swapped by /loadmodel ---- */
 static Transformer gTransformer;          /* active checkpoint weights          */
@@ -3058,12 +3071,22 @@ static void load_new_model(const char *filename) {
  *     arrow keys steer Pacman, ghosts chase, dots/pellets score, ESC returns.
  * ------------------------------------------------------------------------- */
 
-#define PAC_W 23
-#define PAC_H 23
-#define PAC_CELL       48      /* pixels per maze cell                         */
+#define PAC_W 28
+#define PAC_H 31
 #define PAC_TICK_US    160000  /* ~6.25 moves/sec                              */
 #define PAC_FRIGHT_TICKS 40    /* ticks ghosts stay edible after a pellet      */
 #define PAC_MAX_GHOSTS 4
+
+/* Ghost house (classic Pac-Man centre): interior cells + the top door '-' that
+ * only ghosts may cross.  Pacman is blocked by the door, ghosts exit through it
+ * and never re-enter. */
+#define PAC_HOUSE_X0 11
+#define PAC_HOUSE_X1 16
+#define PAC_HOUSE_Y0 13
+#define PAC_HOUSE_Y1 15
+#define PAC_DOOR_X0  13
+#define PAC_DOOR_X1  14
+#define PAC_DOOR_Y   12
 
 #define PAC_SCAN_UP    0x01
 #define PAC_SCAN_DOWN  0x02
@@ -3071,31 +3094,41 @@ static void load_new_model(const char *filename) {
 #define PAC_SCAN_LEFT  0x04
 #define PAC_SCAN_ESC   0x17
 
-/* 23x23 maze: '#' wall, '.' dot, 'o' power pellet, 'P' Pacman, 'G' ghost. */
+/* Classic 28x31 Pac-Man maze: '#' wall, '.' dot, 'o' power pellet, 'P' Pacman,
+ * 'G' ghost, '-' ghost-house door, ' ' empty.  Row 14's open left/right edges
+ * are the wrap-around tunnel. */
 static const char *gPacMaze[PAC_H] = {
-    "#######################",
-    "#.o.#.....#.....#.#.#.#",
-    "##G....#...#.#.....oG.#",
-    "#.......#.#.#...#...#.#",
-    "##...#................#",
-    "#...#...#.#...#...#.#.#",
-    "#..#.#.###.#...#......#",
-    "#.....#.#.......#.#.#.#",
-    "#..#.......#.#.###....#",
-    "#...#.#.#.#.....#...#.#",
-    "#.....................#",
-    "#.#.#.....#P#.#...#.#.#",
-    "####.#.#.#.#...#.###..#",
-    "#.#.............#.#.#.#",
-    "#....#.#...#.#........#",
-    "#.#.#...#.....#.#.#.#.#",
-    "#....#.....#..........#",
-    "#.#.#...#...#.#...#.#.#",
-    "#....#................#",
-    "#.o.#...#.#.#.#.#...o.#",
-    "#.G....#...#.#......G.#",
-    "#.#.#.........#.#.#.#.#",
-    "#######################",
+    "############################",
+    "#............##............#",
+    "#.####.#####.##.#####.####.#",
+    "#o####.#####.##.#####.####o#",
+    "#.####.#####.##.#####.####.#",
+    "#..........................#",
+    "#.####.##.########.##.####.#",
+    "#.####.##.########.##.####.#",
+    "#......##....##....##......#",
+    "######.##### ## #####.######",
+    "######.##### ## #####.######",
+    "######.##          ##.######",
+    "######.## ###--### ##.######",
+    "######.## #      # ##.######",
+    "      .   # GGGG #   .      ",
+    "######.## #      # ##.######",
+    "######.## ######## ##.######",
+    "######.##          ##.######",
+    "######.## ######## ##.######",
+    "######.## ######## ##.######",
+    "#............##............#",
+    "#.####.#####.##.#####.####.#",
+    "#.####.#####.##.#####.####.#",
+    "#o..##.......P .......##..o#",
+    "###.##.##.########.##.##.###",
+    "###.##.##.########.##.##.###",
+    "#......##....##....##......#",
+    "#.##########.##.##########.#",
+    "#.##########.##.##########.#",
+    "#..........................#",
+    "############################",
 };
 
 static char gPacGrid[PAC_H][PAC_W];      /* mutable copy: walls + remaining dots */
@@ -3107,6 +3140,7 @@ static int gPacSpawnX, gPacSpawnY;
 
 static int gPacLives, gPacScore, gPacDotsLeft;
 static int gPacOver, gPacWon;
+static int gPacAuto;                     /* 1 = AI is steering Pacman            */
 
 static int gPacGhosts;
 static int gPacGhostX[PAC_MAX_GHOSTS], gPacGhostY[PAC_MAX_GHOSTS];
@@ -3115,6 +3149,7 @@ static int gPacGhostSpawnX[PAC_MAX_GHOSTS], gPacGhostSpawnY[PAC_MAX_GHOSTS];
 static int gPacFright;                   /* remaining edible ticks (0 = normal) */
 
 static UINT64 gPacAccum;                 /* tick accumulator, microseconds       */
+static int gPacCell;                     /* maze cell size, px (fit to screen)   */
 static int gPacOX, gPacOY;               /* maze origin, px                      */
 
 static UINT32 gPacBg, gPacWall, gPacWallHi, gPacDot, gPacPellet, gPacPac;
@@ -3122,9 +3157,32 @@ static UINT32 gPacGhostCol[PAC_MAX_GHOSTS], gPacFrightCol, gPacWhite, gPacBlack;
 static UINT32 gPacText;
 
 static int pac_abs(int v) { return v < 0 ? -v : v; }
+
+/* Horizontal wrap for the tunnel row: exiting the left edge re-enters on the
+ * right, and vice versa.  On non-tunnel rows both edges are walls, so a wrap
+ * lands on '#' and is naturally blocked. */
+static int pac_wrap_x(int x) {
+    x %= PAC_W;
+    if (x < 0) x += PAC_W;
+    return x;
+}
+
 static int pac_wall(int x, int y) {
-    if (x < 0 || y < 0 || x >= PAC_W || y >= PAC_H) return 1;
-    return gPacGrid[y][x] == '#';
+    if (y < 0 || y >= PAC_H) return 1;
+    x = pac_wrap_x(x);
+    char c = gPacGrid[y][x];
+    return c == '#' || c == '-';          /* the ghost door blocks Pacman too   */
+}
+
+/* Ghosts may cross the door '-' while escaping the house, but never re-enter
+ * once they are out (trapped == 1 means the ghost is still inside). */
+static int pac_ghost_blocked(int x, int y, int trapped) {
+    if (y < 0 || y >= PAC_H) return 1;
+    x = pac_wrap_x(x);
+    char c = gPacGrid[y][x];
+    if (c == '#') return 1;
+    if (!trapped && c == '-') return 1;
+    return 0;
 }
 
 static void pac_fill_circle(int cx, int cy, int r, UINT32 c) {
@@ -3151,48 +3209,62 @@ static void pac_fill_tri(int x0, int y0, int x1, int y1, int x2, int y2, UINT32 
 }
 
 static void pac_draw_cell(int x, int y) {
-    int px = gPacOX + x * PAC_CELL, py = gPacOY + y * PAC_CELL;
-    int cx = px + PAC_CELL / 2, cy = py + PAC_CELL / 2;
+    int cs = gPacCell;
+    int px = gPacOX + x * cs, py = gPacOY + y * cs;
+    int cx = px + cs / 2, cy = py + cs / 2;
     char c = gPacGrid[y][x];
     if (c == '#') {
-        draw_filled_rect(px + 1, py + 1, PAC_CELL - 2, PAC_CELL - 2, gPacWall);
-        draw_filled_rect(px + 2, py + 2, PAC_CELL - 4, 5, gPacWallHi);
-        draw_filled_rect(px + 2, py + 2, 5, PAC_CELL - 4, gPacWallHi);
+        draw_filled_rect(px + 1, py + 1, cs - 2, cs - 2, gPacWall);
+        int hi = cs / 10; if (hi < 2) hi = 2;
+        draw_filled_rect(px + 2, py + 2, cs - 4, hi, gPacWallHi);
+        draw_filled_rect(px + 2, py + 2, hi, cs - 4, gPacWallHi);
     } else if (c == '.') {
-        pac_fill_circle(cx, cy, 5, gPacDot);
+        int r = cs / 6; if (r < 2) r = 2;
+        pac_fill_circle(cx, cy, r, gPacDot);
     } else if (c == 'o') {
-        pac_fill_circle(cx, cy, 12, gPacPellet);
+        int r = cs / 3; if (r < 4) r = 4;
+        pac_fill_circle(cx, cy, r, gPacPellet);
+    } else if (c == '-') {
+        draw_filled_rect(px + 2, cy - 2, cs - 4, 4, gPacFrightCol);  /* pink door */
     }
 }
 
 static void pac_draw_pacman(void) {
-    int cx = gPacOX + gPacX * PAC_CELL + PAC_CELL / 2;
-    int cy = gPacOY + gPacY * PAC_CELL + PAC_CELL / 2;
-    pac_fill_circle(cx, cy, PAC_CELL / 2 - 4, gPacPac);
+    int cs = gPacCell;
+    int cx = gPacOX + gPacX * cs + cs / 2;
+    int cy = gPacOY + gPacY * cs + cs / 2;
+    int r = cs / 2 - 4; if (r < 2) r = 2;
+    pac_fill_circle(cx, cy, r, gPacPac);
     int dx = gPacDirX, dy = gPacDirY;
     if (dx == 0 && dy == 0) { dx = 1; dy = 0; }
     int px = -dy, py = dx;               /* perpendicular of the facing vector */
+    int mo = cs / 5; if (mo < 2) mo = 2; /* mouth depth */
     pac_fill_tri(cx, cy,
-                 cx + dx * 10 + px * 10, cy + dy * 10 + py * 10,
-                 cx + dx * 10 - px * 10, cy + dy * 10 - py * 10,
+                 cx + dx * mo + px * mo, cy + dy * mo + py * mo,
+                 cx + dx * mo - px * mo, cy + dy * mo - py * mo,
                  gPacBg);
 }
 
 static void pac_draw_ghost(int i) {
-    int cx = gPacOX + gPacGhostX[i] * PAC_CELL + PAC_CELL / 2;
-    int cy = gPacOY + gPacGhostY[i] * PAC_CELL + PAC_CELL / 2;
+    int cs = gPacCell;
+    int cx = gPacOX + gPacGhostX[i] * cs + cs / 2;
+    int cy = gPacOY + gPacGhostY[i] * cs + cs / 2;
     UINT32 body = gPacFright ? gPacFrightCol : gPacGhostCol[i];
-    int r = PAC_CELL / 2 - 9;
-    pac_fill_circle(cx, cy - 5, r, body);
-    draw_filled_rect(cx - r, cy - 5, 2 * r, r + 9, body);
-    pac_fill_circle(cx - r + 4, cy + r + 2, 4, body);   /* three wavy "feet" */
-    pac_fill_circle(cx,           cy + r + 2, 4, body);
-    pac_fill_circle(cx + r - 4, cy + r + 2, 4, body);
-    pac_fill_circle(cx - 7, cy - 7, 5, gPacWhite);      /* eyes               */
-    pac_fill_circle(cx + 7, cy - 7, 5, gPacWhite);
-    int pr = gPacFright ? 2 : 3;
-    pac_fill_circle(cx - 7, cy - 7, pr, gPacBlack);
-    pac_fill_circle(cx + 7, cy - 7, pr, gPacBlack);
+    int r  = cs / 2 - 9; if (r < 3) r = 3;
+    int to = r / 2;                       /* how far the dome rises above centre */
+    int ex = r / 2; if (ex < 2) ex = 2;   /* eye x offset                         */
+    int er = r / 3; if (er < 1) er = 1;   /* eye radius                           */
+    int fr = r / 3; if (fr < 1) fr = 1;   /* foot radius                          */
+    pac_fill_circle(cx, cy - to, r, body);
+    draw_filled_rect(cx - r, cy - to, 2 * r, r + to, body);
+    pac_fill_circle(cx - r + fr * 2, cy + r + fr, fr, body);   /* wavy "feet"   */
+    pac_fill_circle(cx,             cy + r + fr, fr, body);
+    pac_fill_circle(cx + r - fr * 2, cy + r + fr, fr, body);
+    pac_fill_circle(cx - ex, cy - to - 2, er, gPacWhite);       /* eyes          */
+    pac_fill_circle(cx + ex, cy - to - 2, er, gPacWhite);
+    int pr = gPacFright ? 2 : 3; if (pr > er) pr = er;
+    pac_fill_circle(cx - ex, cy - to - 2, pr, gPacBlack);
+    pac_fill_circle(cx + ex, cy - to - 2, pr, gPacBlack);
 }
 
 static void pac_draw_hud(void) {
@@ -3200,7 +3272,10 @@ static void pac_draw_hud(void) {
     int n;
     const char *p;
 
-    gui_text((int)(gFbWidth - 6 * HRFONT_W) / 2, 40, "PACMAN", gPacText, gPacBg);
+    const char *title = gPacAuto ? "PACMAN - AI AUTO" : "PACMAN";
+    int tlen = (int)strlen(title);
+    gui_text((int)(gFbWidth - tlen * HRFONT_W) / 2, 40, title,
+             gPacAuto ? gPacPac : gPacText, gPacBg);
 
     n = 0;
     for (p = "SCORE "; *p; p++) buf[n++] = *p;
@@ -3213,11 +3288,11 @@ static void pac_draw_hud(void) {
     gui_itoa(gPacLives, buf + n); while (buf[n]) n++;
     buf[n] = '\0';
     int lw = (int)strlen(buf) * HRFONT_W;
-    gui_text(gPacOX + PAC_W * PAC_CELL - lw, 104, buf, gPacText, gPacBg);
+    gui_text(gPacOX + PAC_W * gPacCell - lw, 104, buf, gPacText, gPacBg);
 
-    const char *hint = "Arrows / WASD = move    Q or ESC = quit";
+    const char *hint = "Arrows / WASD = move    SPACE = AI plays    Q/ESC = quit";
     int hw = (int)strlen(hint) * HRFONT_W;
-    gui_text((int)(gFbWidth - hw) / 2, gPacOY + PAC_H * PAC_CELL + 40,
+    gui_text((int)(gFbWidth - hw) / 2, gPacOY + PAC_H * gPacCell + 40,
              hint, gPacText, gPacBg);
 }
 
@@ -3229,7 +3304,7 @@ static void pac_draw_over(void) {
     int w = (mw > sw ? mw : sw) + 64;
     int h = 96;
     int x = (int)(gFbWidth - w) / 2;
-    int y = gPacOY + PAC_H * PAC_CELL / 2 - h / 2;
+    int y = gPacOY + PAC_H * gPacCell / 2 - h / 2;
     UINT32 bg = fb_make_color(0x10, 0x14, 0x1A);
     draw_filled_rect(x, y, w, h, bg);
     draw_rect(x, y, w, h, gColBorder);
@@ -3260,8 +3335,18 @@ static void pac_respawn(void) {
 }
 
 static void pac_init(void) {
-    gPacOX = ((int)gFbWidth - PAC_W * PAC_CELL) / 2;
-    gPacOY = 180;
+    /* Fit the 28x31 classic maze to the screen, keeping the title/score rows on
+     * top and the hint line on the bottom visible. */
+    gPacOY = 160;
+    int avail_h = (int)gFbHeight - gPacOY - 90;
+    int avail_w = (int)gFbWidth;
+    int cell = avail_h / PAC_H;
+    if (cell * PAC_W > avail_w) cell = avail_w / PAC_W;
+    if (cell > 48) cell = 48;
+    if (cell < 18) cell = 18;
+    gPacCell = cell;
+    gPacOX = ((int)gFbWidth - PAC_W * gPacCell) / 2;
+
     gPacLives = 3;
     gPacScore = 0;
     gPacDotsLeft = 0;
@@ -3269,6 +3354,7 @@ static void pac_init(void) {
     gPacWon = 0;
     gPacFright = 0;
     gPacAccum = 0;
+    gPacAuto = 0;
     gPacDirX = 1; gPacDirY = 0; gPacNextX = 1; gPacNextY = 0;
     gPacGhosts = 0;
 
@@ -3317,13 +3403,13 @@ static void pac_move_pacman(void) {
     if (gPacNextX || gPacNextY) {
         int tx = gPacX + gPacNextX, ty = gPacY + gPacNextY;
         if (!pac_wall(tx, ty)) {
-            gPacX = tx; gPacY = ty;
+            gPacX = pac_wrap_x(tx); gPacY = ty;
             gPacDirX = gPacNextX; gPacDirY = gPacNextY;
         }
     }
     if (gPacX == ox && gPacY == oy) {   /* buffered turn was blocked: keep facing */
         int tx = gPacX + gPacDirX, ty = gPacY + gPacDirY;
-        if (!pac_wall(tx, ty)) { gPacX = tx; gPacY = ty; }
+        if (!pac_wall(tx, ty)) { gPacX = pac_wrap_x(tx); gPacY = ty; }
     }
     char c = gPacGrid[gPacY][gPacX];
     if (c == '.') {
@@ -3339,29 +3425,131 @@ static void pac_move_pacman(void) {
 static void pac_move_ghost(int i) {
     static const int cd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     int x = gPacGhostX[i], y = gPacGhostY[i];
+    /* "trapped" = still inside the house or standing in the doorway: the ghost
+     * keeps escaping until it is fully above the door (y < PAC_DOOR_Y). */
+    int trapped = (y == PAC_DOOR_Y)
+        ? (x >= PAC_DOOR_X0 && x <= PAC_DOOR_X1)
+        : (x >= PAC_HOUSE_X0 && x <= PAC_HOUSE_X1
+        && y >= PAC_HOUSE_Y0 && y <= PAC_HOUSE_Y1);
+
+    int tx, ty;
+    if (trapped)      { tx = PAC_DOOR_X0; ty = PAC_DOOR_Y - 1; }  /* escape */
+    else              { tx = gPacX;       ty = gPacY; }           /* chase   */
+
     int best = -1, bestscore = -1000000000;
     for (int k = 0; k < 4; k++) {
         int nx = x + cd[k][0], ny = y + cd[k][1];
-        if (pac_wall(nx, ny)) continue;
-        if (nx == x - gPacGhostDX[i] && ny == y - gPacGhostDY[i]) continue; /* no U-turn */
+        if (pac_ghost_blocked(nx, ny, trapped)) continue;
+        if (!trapped && nx == x - gPacGhostDX[i] && ny == y - gPacGhostDY[i])
+            continue;                                           /* no U-turn   */
         int score;
-        if (gPacFright)
-            score = (nx * 7 + ny * 13) % 4;                 /* scatter / wander */
+        if (gPacFright && !trapped)
+            score = (nx * 7 + ny * 13) % 4;                     /* scatter     */
         else
-            score = 1000 - (pac_abs(nx - gPacX) + pac_abs(ny - gPacY));  /* chase */
+            score = 1000 - (pac_abs(pac_wrap_x(nx) - tx) + pac_abs(ny - ty));
         if (cd[k][0] == gPacGhostDX[i] && cd[k][1] == gPacGhostDY[i]) score += 50;
         if (score > bestscore) { bestscore = score; best = k; }
     }
     if (best < 0) {                             /* only a U-turn is possible */
         for (int k = 0; k < 4; k++) {
-            if (!pac_wall(x + cd[k][0], y + cd[k][1])) { best = k; break; }
+            if (!pac_ghost_blocked(x + cd[k][0], y + cd[k][1], trapped)) {
+                best = k; break;
+            }
         }
     }
     if (best < 0) return;                       /* trapped (should not happen) */
     gPacGhostDX[i] = cd[best][0];
     gPacGhostDY[i] = cd[best][1];
-    gPacGhostX[i] = x + gPacGhostDX[i];
-    gPacGhostY[i] = y + gPacGhostDY[i];
+    gPacGhostX[i] = pac_wrap_x(x + cd[best][0]);
+    gPacGhostY[i] = y + cd[best][1];
+}
+
+/* ----------------------------------------------------------------------------
+ * AI auto-play (SPACE toggles it on/off; the slash form is /games pacman auto).
+ * The AI steers Pacman toward the nearest dot/pellet, flees when a ghost is
+ * close, and chases frightened ghosts to eat them.
+ * ------------------------------------------------------------------------- */
+
+/* BFS from (sx,sy) to the nearest remaining dot/pellet; writes the first-step
+ * direction into *odx,*ody and returns 1 when food is still reachable. */
+static int pac_food_dir(int sx, int sy, int *odx, int *ody) {
+    static const int cd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    static int dist[PAC_H][PAC_W];
+    static int prev[PAC_H][PAC_W];
+    static int qx[PAC_W * PAC_H], qy[PAC_W * PAC_H];
+    for (int y = 0; y < PAC_H; y++)
+        for (int x = 0; x < PAC_W; x++) dist[y][x] = -1;
+    int head = 0, tail = 0;
+    qx[tail] = sx; qy[tail] = sy; tail++;
+    dist[sy][sx] = 0;
+    int fx = -1, fy = -1;
+    while (head < tail) {
+        int x = qx[head], y = qy[head]; head++;
+        if (gPacGrid[y][x] == '.' || gPacGrid[y][x] == 'o') { fx = x; fy = y; break; }
+        for (int k = 0; k < 4; k++) {
+            int nx = x + cd[k][0], ny = y + cd[k][1];
+            if (pac_wall(nx, ny)) continue;
+            nx = pac_wrap_x(nx);
+            if (dist[ny][nx] >= 0) continue;
+            dist[ny][nx] = dist[y][x] + 1;
+            prev[ny][nx] = k;
+            qx[tail] = nx; qy[tail] = ny; tail++;
+        }
+    }
+    if (fx < 0) { *odx = 0; *ody = 0; return 0; }
+    int x = fx, y = fy;
+    while (dist[y][x] > 1) {
+        int k = prev[y][x];
+        x = pac_wrap_x(x - cd[k][0]);
+        y = y - cd[k][1];
+    }
+    int k = prev[y][x];
+    *odx = cd[k][0]; *ody = cd[k][1];
+    return 1;
+}
+
+/* Choose a valid direction that moves toward (away==0) or away from (away!=0)
+ * (tx,ty), using Manhattan distance.  Returns 1 and fills *odx,*ody on success. */
+static int pac_dir_toward(int tx, int ty, int away, int *odx, int *ody) {
+    static const int cd[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    int best = -1, bestscore = away ? -1000000000 : 1000000000;
+    for (int k = 0; k < 4; k++) {
+        int nx = gPacX + cd[k][0], ny = gPacY + cd[k][1];
+        if (pac_wall(nx, ny)) continue;
+        int d = pac_abs(pac_wrap_x(nx) - tx) + pac_abs(ny - ty);
+        int s = away ? d : -d;
+        if (cd[k][0] == gPacDirX && cd[k][1] == gPacDirY) s += 1;  /* prefer straight */
+        if (s > bestscore) { bestscore = s; best = k; }
+    }
+    if (best < 0) return 0;
+    *odx = cd[best][0]; *ody = cd[best][1];
+    return 1;
+}
+
+static void pac_auto_decide(void) {
+    int gi = -1, gd = 1000;
+    for (int i = 0; i < gPacGhosts; i++) {
+        int d = pac_abs(gPacX - gPacGhostX[i]) + pac_abs(gPacY - gPacGhostY[i]);
+        if (d < gd) { gd = d; gi = i; }
+    }
+
+    if (gPacFright) {
+        if (gi >= 0 && gd <= 6) {                       /* chase a ghost to eat it */
+            int odx, ody;
+            if (pac_dir_toward(gPacGhostX[gi], gPacGhostY[gi], 0, &odx, &ody)) {
+                gPacNextX = odx; gPacNextY = ody; return;
+            }
+        }
+    } else if (gi >= 0 && gd <= 4) {                    /* flee a nearby ghost    */
+        int odx, ody;
+        if (pac_dir_toward(gPacGhostX[gi], gPacGhostY[gi], 1, &odx, &ody)) {
+            gPacNextX = odx; gPacNextY = ody; return;
+        }
+    }
+
+    int odx, ody;                                        /* otherwise: eat dots    */
+    if (pac_food_dir(gPacX, gPacY, &odx, &ody) && (odx || ody))
+        gPacNextX = odx, gPacNextY = ody;
 }
 
 static void pac_collide(void) {
@@ -3385,6 +3573,7 @@ static void pac_collide(void) {
 
 static void pac_tick(void) {
     if (gPacOver) return;
+    if (gPacAuto) pac_auto_decide();
     pac_move_pacman();
     for (int i = 0; i < gPacGhosts; i++) pac_move_ghost(i);
     if (gPacFright) gPacFright--;
@@ -3407,24 +3596,39 @@ static void pac_key(EFI_INPUT_KEY key) {
         return;
     }
 
+    /* SPACE toggles AI auto-play */
+    if (ch == ' ' || ch == 0x20) {
+        gPacAuto = !gPacAuto;
+        pac_draw_hud();               /* repaint title bar (show/hide AUTO tag) */
+        return;
+    }
+
+    int want = 0;
+    int nx = 0, ny = 0;
+
     /* arrow keys (EFI scan codes) */
     switch (key.ScanCode) {
-    case PAC_SCAN_LEFT:  gPacNextX = -1; gPacNextY =  0; return;
-    case PAC_SCAN_RIGHT: gPacNextX =  1; gPacNextY =  0; return;
-    case PAC_SCAN_UP:    gPacNextX =  0; gPacNextY = -1; return;
-    case PAC_SCAN_DOWN:  gPacNextX =  0; gPacNextY =  1; return;
+    case PAC_SCAN_LEFT:  nx = -1; ny =  0; want = 1; break;
+    case PAC_SCAN_RIGHT: nx =  1; ny =  0; want = 1; break;
+    case PAC_SCAN_UP:    nx =  0; ny = -1; want = 1; break;
+    case PAC_SCAN_DOWN:  nx =  0; ny =  1; want = 1; break;
     case PAC_SCAN_ESC:   pac_quit(); return;
     default: break;
     }
 
     /* WASD fallback (UnicodeChar) — reliable on any keyboard, incl. QMP tests */
     switch (ch) {
-    case 'w': case 'W': gPacNextX =  0; gPacNextY = -1; break;
-    case 's': case 'S': gPacNextX =  0; gPacNextY =  1; break;
-    case 'a': case 'A': gPacNextX = -1; gPacNextY =  0; break;
-    case 'd': case 'D': gPacNextX =  1; gPacNextY =  0; break;
-    case 'q': case 'Q': case 0x1B: pac_quit(); break;
+    case 'w': case 'W': nx =  0; ny = -1; want = 1; break;
+    case 's': case 'S': nx =  0; ny =  1; want = 1; break;
+    case 'a': case 'A': nx = -1; ny =  0; want = 1; break;
+    case 'd': case 'D': nx =  1; ny =  0; want = 1; break;
+    case 'q': case 'Q': case 0x1B: pac_quit(); return;
     default: break;
+    }
+
+    if (want) {
+        if (gPacAuto) { gPacAuto = 0; pac_draw_hud(); }  /* manual takes over */
+        gPacNextX = nx; gPacNextY = ny;
     }
 }
 
@@ -3453,7 +3657,8 @@ static void process_slash_command(char *input) {
         gui_chat_add(">   /loadmodel FILE  load a model checkpoint");
         gui_chat_add(">   /listmodel       list available models");
         gui_chat_add(">   /train           enter training mode");
-        gui_chat_add(">   /games pacman    play Pacman");
+        gui_chat_add(">   /games pacman    play Pacman (classic map)");
+        gui_chat_add(">   /games pacman auto   Pacman, AI plays itself");
     } else if (strcmp(cmd, "loadmodel") == 0) {
         if (arg && *arg) load_new_model(arg);
         else             gui_chat_add("> usage: /loadmodel <filename>");
@@ -3470,11 +3675,15 @@ static void process_slash_command(char *input) {
         gTrainingMode = 1;
         gui_chat_add("> training mode ON (placeholder)");
     } else if (strcmp(cmd, "games") == 0) {
-        if (arg && strcmp(arg, "pacman") == 0) {
+        if (arg && strncmp(arg, "pacman", 6) == 0) {
+            /* optional trailing "auto" -> AI plays by itself */
+            const char *rest = arg + 6;
+            while (*rest == ' ') rest++;
+            gPacAuto = (strncmp(rest, "auto", 4) == 0) ? 1 : 0;
             gGameMode = GAME_MODE_PACMAN;
             pac_init();
         } else {
-            gui_chat_add("> usage: /games pacman");
+            gui_chat_add("> usage: /games pacman [auto]");
         }
     } else {
         gui_chat_add2("> unknown command: /", cmd);
@@ -3594,13 +3803,15 @@ static void gui_handle_key(EFI_INPUT_KEY key) {
     gui_repaint_input();
 }
 
-static void gui_poll_mouse(void) {
+static int gui_poll_mouse(void) {
+    int activity = 0;
+
     if (gAbsMouse != NULL) {
         /* Absolute tablet: map CurrentX/Y from [AbsoluteMin, AbsoluteMax] onto
          * the framebuffer, then reuse the same move/click path as the mouse. */
         EFI_ABSOLUTE_POINTER_STATE st;
         EFI_STATUS s = uefi_call_wrapper(gAbsMouse->GetState, 2, gAbsMouse, &st);
-        if (s == EFI_NOT_READY || EFI_ERROR(s)) return;
+        if (s == EFI_NOT_READY || EFI_ERROR(s)) return 0;
 
         UINT64 minx = 0, maxx = 0x7FFF, miny = 0, maxy = 0x7FFF;
         if (gAbsMouse->Mode != NULL) {
@@ -3615,30 +3826,55 @@ static void gui_poll_mouse(void) {
         UINT64 cy = st.CurrentY >= miny ? (st.CurrentY - miny) : 0;
         int nx = (int)(cx * (UINT64)(gFbWidth  - 1) / spanx);
         int ny = (int)(cy * (UINT64)(gFbHeight - 1) / spany);
-        mouse_move_to(nx, ny);
-
         int left = (st.ActiveButtons & EFI_ABSP_TouchActive) != 0;
+        if (left || nx != gMouseX || ny != gMouseY) activity = 1;
+
+        mouse_move_to(nx, ny);
         if (left && !gMouseLeftWasDown)      /* rising edge = a fresh click */
             gui_click(mouse_hot_x(), mouse_hot_y());
         gMouseLeftWasDown = left;
-        return;
+        return activity;
     }
 
-    if (gMouse == NULL) return;
+    if (gMouse == NULL) return 0;
 
     EFI_SIMPLE_POINTER_STATE st;
     EFI_STATUS s = uefi_call_wrapper(gMouse->GetState, 2, gMouse, &st);
-    if (s == EFI_NOT_READY || EFI_ERROR(s)) return;
+    if (s == EFI_NOT_READY || EFI_ERROR(s)) return 0;
 
     int dx = (int)st.RelativeMovementX / MOUSE_SENSITIVITY;
     int dy = (int)st.RelativeMovementY / MOUSE_SENSITIVITY;
-    if (dx != 0 || dy != 0)
+    if (dx != 0 || dy != 0) {
         mouse_move_to(gMouseX + dx, gMouseY + dy);
+        activity = 1;
+    }
 
     int left = (st.LeftButton != 0);
-    if (left && !gMouseLeftWasDown)      /* rising edge = a fresh click */
+    if (left && !gMouseLeftWasDown) {    /* rising edge = a fresh click */
         gui_click(mouse_hot_x(), mouse_hot_y());
+        activity = 1;
+    }
     gMouseLeftWasDown = left;
+    return activity;
+}
+
+/* Non-destructive input probe for the screensaver: reports whether the pointer
+ * moved or a button is held, without moving the on-screen cursor or dispatching
+ * a click (so the wake-up motion doesn't also fire a Send). */
+static int mouse_has_activity(void) {
+    if (gAbsMouse != NULL) {
+        EFI_ABSOLUTE_POINTER_STATE st;
+        EFI_STATUS s = uefi_call_wrapper(gAbsMouse->GetState, 2, gAbsMouse, &st);
+        if (s == EFI_NOT_READY || EFI_ERROR(s)) return 0;
+        return st.ActiveButtons != 0;
+    }
+    if (gMouse == NULL) return 0;
+
+    EFI_SIMPLE_POINTER_STATE st;
+    EFI_STATUS s = uefi_call_wrapper(gMouse->GetState, 2, gMouse, &st);
+    if (s == EFI_NOT_READY || EFI_ERROR(s)) return 0;
+    return st.RelativeMovementX != 0 || st.RelativeMovementY != 0
+        || st.LeftButton || st.RightButton;
 }
 
 static void gui_init(void) {
@@ -3654,6 +3890,47 @@ static void gui_init(void) {
         mouse_save();
         mouse_draw();
     }
+}
+
+/* ----------------------------------------------------------------------------
+ * 5'. Screensaver: a black desktop with a bouncing "BARE-METAL AI" logo, shown
+ *     after 30 minutes of no input; any key/mouse wakes it back to the desktop.
+ * ------------------------------------------------------------------------- */
+
+static void screensaver_draw(void) {
+    fb_fill(0, 0, gFbWidth, gFbHeight, gSaverBg);
+    gui_text(gSaverX, gSaverY, "BARE-METAL AI", gSaverFg, gSaverBg);
+    gui_text(gSaverX, gSaverY + HRFONT_H, "press any key", gSaverDim, gSaverBg);
+}
+
+static void screensaver_enter(void) {
+    if (mouse_available()) mouse_restore();   /* erase the pointer first       */
+    gSaverBg  = fb_make_color(0x00, 0x00, 0x00);
+    gSaverFg  = fb_make_color(0x6F, 0xC3, 0xDF);
+    gSaverDim = fb_make_color(0x3A, 0x4A, 0x60);
+    gSaverX   = (int)gFbWidth / 2 - 200;
+    gSaverY   = (int)gFbHeight / 2 - HRFONT_H;
+    gSaverDX  = 4;
+    gSaverDY  = 3;
+    gSaverAccumUs = 0;
+    screensaver_draw();
+}
+
+static void screensaver_tick(void) {
+    int tw = (int)strlen("BARE-METAL AI") * HRFONT_W;
+    int th = HRFONT_H * 2;                     /* logo + hint lines             */
+    gSaverX += gSaverDX;
+    gSaverY += gSaverDY;
+    if (gSaverX <= 0)                       { gSaverX = 0;            gSaverDX = -gSaverDX; }
+    if (gSaverY <= 0)                       { gSaverY = 0;            gSaverDY = -gSaverDY; }
+    if (gSaverX + tw >= (int)gFbWidth)      { gSaverX = (int)gFbWidth - tw;  gSaverDX = -gSaverDX; }
+    if (gSaverY + th >= (int)gFbHeight)     { gSaverY = (int)gFbHeight - th; gSaverDY = -gSaverDY; }
+    screensaver_draw();
+}
+
+static void screensaver_exit(void) {
+    gui_draw_desktop();                        /* repaint the full chat desktop */
+    if (mouse_available()) { mouse_save(); mouse_draw(); }
 }
 
 static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
@@ -3676,11 +3953,31 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
         /* 1. keyboard: non-blocking read; act only when a key is present */
         EFI_INPUT_KEY key;
         EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
-        if (ks == EFI_SUCCESS)
-            gui_handle_key(key);
+        int key_activity = (ks == EFI_SUCCESS);
+
+        /* While the screensaver is up, any input only wakes it (and is then
+         * swallowed, so a wake key doesn't also type into the input box). */
+        if (gSaverOn) {
+            int mouse_activity = mouse_has_activity();
+            if (key_activity || mouse_activity) {
+                screensaver_exit();
+                gSaverOn = 0;
+                gIdleUs = 0;
+            } else {
+                gSaverAccumUs += GUI_POLL_US;
+                if (gSaverAccumUs >= SCREENSAVER_MOVE_US) {
+                    gSaverAccumUs -= SCREENSAVER_MOVE_US;
+                    screensaver_tick();
+                }
+                uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            }
+            continue;
+        }
+
+        if (key_activity) { gui_handle_key(key); gIdleUs = 0; }
 
         /* 2. mouse: poll relative movement and button clicks */
-        gui_poll_mouse();
+        if (gui_poll_mouse()) gIdleUs = 0;
 
         /* 3. blink the input caret while idle */
         gui_caret_blink();
@@ -3689,7 +3986,15 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
         if (gEmotionHoldLoops > 0 && --gEmotionHoldLoops == 0)
             gui_set_emotion(EMOTION_IDLE);
 
-        /* 5. idle yield so we do not spin the CPU at 100% */
+        /* 5. after 30 min without input, blank into the screensaver */
+        gIdleUs += GUI_POLL_US;
+        if (gIdleUs >= SCREENSAVER_IDLE_US) {
+            screensaver_enter();
+            gSaverOn = 1;
+            gIdleUs = 0;
+        }
+
+        /* 6. idle yield so we do not spin the CPU at 100% */
         uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
     }
 }
