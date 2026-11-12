@@ -2059,8 +2059,9 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         }
         pos++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1) { break; }
+        // data-dependent terminating condition: the EOS (</s> = 2) token ends the
+        // reply.  (This vocab is <unk>=0, <s>=1, </s>=2, so 2 — not 1 — is EOS.)
+        if (next == 2) { break; }
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
