@@ -21,13 +21,8 @@ __pycache__/
 
 # Training data & checkpoints (regenerable)
 /data/
-/llama2c/out_thai/
-/llama2c/out_thai_v2/
-/thai_corpus.txt
-
-# Generated intermediate corpus variants + repeated Q&A (regenerable)
-/thai_corpus_clean.txt
-/thai_corpus_v2.txt
+/llama2c/out_thai*/
+/thai_corpus*.txt
 /thai_qa.txt
 /kb.txt
 

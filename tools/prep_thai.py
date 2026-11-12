@@ -13,7 +13,8 @@ Outputs (both are flat little-endian uint16 arrays, no header):
 import os
 import argparse
 import random
-import numpy as np
+from array import array
+
 import sentencepiece as spm
 
 
@@ -46,6 +47,7 @@ def main():
                                 else text.split('\n'))]
     docs = [d for d in docs if d]          # drop empty lines/paragraphs
     assert docs, "no non-empty documents found"
+    del text  # free the raw buffer before encoding
 
     # 4. Deterministic document-level train/val split (no leakage across a doc).
     rng = random.Random(args.seed)
@@ -54,9 +56,11 @@ def main():
     n_val = max(1, int(len(docs) * args.val_split))
     val_set = set(order[:n_val])
 
-    # 5. Encode each document as [BOS] + ids + [EOS], concatenating everything.
+    # 5. Encode each document as [BOS] + ids + [EOS], accumulating into a
+    #    compact uint16 array (2 bytes/token) rather than a Python list of ints
+    #    (~36 bytes/token) — a large corpus would otherwise OOM the machine.
     def encode_all(doc_list):
-        ids = []
+        ids = array('H')          # native byte order == little-endian on this box
         for d in doc_list:
             ids.append(bos)
             ids.extend(sp.encode(d, out_type=int))
@@ -68,11 +72,13 @@ def main():
 
     # 6. Write flat uint16 arrays (native/little-endian), exactly what
     #    np.memmap(..., dtype=np.uint16) in train.py expects.
-    np.array(train_ids, dtype=np.uint16).tofile(os.path.join(args.out_dir, 'train.bin'))
-    np.array(val_ids,   dtype=np.uint16).tofile(os.path.join(args.out_dir, 'val.bin'))
+    with open(os.path.join(args.out_dir, 'train.bin'), 'wb') as f:
+        train_ids.tofile(f)
+    with open(os.path.join(args.out_dir, 'val.bin'), 'wb') as f:
+        val_ids.tofile(f)
 
     # Sanity: decode the first document back to text to confirm Thai round-trips.
-    sample = sp.decode(train_ids[:30])
+    sample = sp.decode(list(train_ids[:30]))
     print(f"docs: {len(docs)}  (train {len(docs)-len(val_set)}, val {len(val_set)})")
     print(f"train tokens: {len(train_ids):,}   val tokens: {len(val_ids):,}")
     print(f"wrote {args.out_dir}/train.bin and {args.out_dir}/val.bin")
