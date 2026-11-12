@@ -28,6 +28,7 @@
 | `/export-model` | export checkpoint → Q8_0 v2 | 4 |
 | `/build` | คอมไพล์ `run.c` → `BOOTX64.EFI` | — |
 | `/deploy` | ชี้ `run.c` ไปที่โมเดล + ลง USB | 5 |
+| `/createboot` | ฟอร์แมต USB จริง + ลงไฟล์ boot สำหรับเครื่องจริง | 5 |
 
 **Pipeline เต็ม:** `/corpus` → `/prep` → `/train` → `/export-model` → `/deploy`
 
@@ -96,6 +97,15 @@ export `ckpt.pt` → `stories15M_thai_q80.bin` (Q8_0) พร้อมตรว�
 /deploy stories15M_q80.bin          → โมเดลเล็กอังกฤษ
 /deploy tinyllama_q80.bin           → โมเดลใหญ่
 ```
+
+### `/createboot [disk]`
+ฟอร์แมต USB จริงเป็น FAT32 แล้วลงไฟล์ boot ทั้งหมด (สำหรับบูตเครื่องจริง)
+```
+/createboot              → ไม่ระบุ disk → โชว์ diskutil list ให้เลือก
+/createboot /dev/disk4   → ลง USB ตัว disk4
+```
+> ต่างจาก `/deploy` ที่แค่ build ลงโฟลเดอร์ `fat_usb/` (ใช้กับ QEMU) — `/createboot`
+> จะฟอร์แมต USB จริง + copy ไฟล์ + eject ให้พร้อมบูตเครื่องจริงทันที
 
 ---
 

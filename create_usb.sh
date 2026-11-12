@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # create_usb.sh — format a USB drive as MS-DOS FAT32 (MBR) and copy the
-# bare-metal UEFI AI files (EFI/BOOT/BOOTX64.EFI, tinyllama_q80.bin, tokenizer.bin)
-# from ./fat_usb onto it, then sync + eject.
+# bare-metal UEFI AI files (EFI/BOOT/BOOTX64.EFI, the model .bin, tokenizer.bin,
+# kb.txt) from ./fat_usb onto it, then sync + eject.
 #
 # Usage:
 #   diskutil list                    # find your USB (e.g. /dev/disk4)
@@ -160,11 +160,14 @@ else
 fi
 
 echo "==> Verifying ..."
-for f in "EFI/BOOT/BOOTX64.EFI" "tinyllama_q80.bin" "tokenizer.bin"; do
+# Boot-critical files: the app, the default checkpoint, and the tokenizer.
+# kb.txt is optional (run.c skips KB lookup if it is missing).
+for f in "EFI/BOOT/BOOTX64.EFI" "stories15M_thai_q80.bin" "tokenizer.bin"; do
     if [[ ! -e "$VOLUME/$f" ]]; then
-        echo "WARNING: expected file not found after copy: $f"
+        echo "ERROR: expected file not found after copy: $f"
     fi
 done
+[[ -e "$VOLUME/kb.txt" ]] || echo "NOTE: kb.txt not present — the KB layer will be skipped."
 ls -la "$VOLUME" "$VOLUME/EFI/BOOT" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
