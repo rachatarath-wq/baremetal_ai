@@ -202,6 +202,7 @@ Some docs are in Thai (the project's working language):
 | [`GUIDE_THAI.md`](GUIDE_THAI.md) | 🇹🇭 Thai | Overall Thai-language guide |
 | [`TRAIN_THAI.md`](TRAIN_THAI.md) | 🇹🇭 Thai | Training pipeline in detail |
 | [`COMMANDS_THAI.md`](COMMANDS_THAI.md) | 🇹🇭 Thai | Slash commands |
+| [`QUESTIONS_THAI.md`](QUESTIONS_THAI.md) | 🇬🇧+🇹🇭 | Tourism model test prompts |
 | [`PROTOTYPE.md`](PROTOTYPE.md) | 🇹🇭 Thai | Status, roadmap, scaling/budget decisions |
 | [`PENDING.md`](PENDING.md) | 🇹🇭 Thai | Open tasks / notes |
 
