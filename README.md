@@ -1,193 +1,213 @@
-# Bare-metal llama2.c as a UEFI payload (BOOTX64.EFI)
+# Bare-metal AI — a Thai LLM that boots from USB with no OS
+# AI บน bare-metal — โมเดลภาษาไทยที่บูตจาก USB โดยไม่มี OS
 
-Port of Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) `run.c` to run
-entirely bare-metal — no operating system, no libc. The result is a single PE/COFF UEFI
-application that firmware loads and runs directly.
+A small **Thai language model** that runs directly on **UEFI firmware** — no operating
+system, no libc, no kernel. The whole thing compiles to a single `BOOTX64.EFI` image that
+firmware loads and executes straight from a USB stick. Turn a PC on, and the AI is on
+screen before any OS would have started.
 
-- **Cross-compiler:** `x86_64-w64-mingw32-gcc` (mingw-w64), running on macOS
-- **UEFI lib:** `gnu-efi`
-- **Output:** `build/BOOTX64.EFI` (PE32+, subsystem `0x0a` EFI application, `.reloc` present)
+**โมเดลภาษาไทยขนาดเล็ก**ที่รันบน **เฟิร์มแวร์ UEFI** โดยตรง — ไม่มีระบบปฏิบัติการ ไม่มี
+libc ไม่มีเคอร์เนล ทั้งหมดคอมไพล์เป็นไฟล์เดียว `BOOTX64.EFI` ที่เฟิร์มแวร์โหลดและรันจาก
+USB ทันที เปิดเครื่องปุ๊บ AI ก็โผล่บนจอก่อนที่ OS ใด ๆ จะบูตด้วยซ้ำ
+
+It is a from-scratch port of Andrej Karpathy's
+[llama2.c](https://github.com/karpathy/llama2.c) `run.c` to a bare-metal UEFI payload.
+
+พอร์ตจาก [llama2.c](https://github.com/karpathy/llama2.c) ของ Andrej Karpathy
+(`run.c`) มาเป็น UEFI payload แบบ bare-metal ตั้งแต่ศูนย์
 
 ---
 
-## Files
+## What it can do · ความสามารถ
 
-| File | Purpose |
+- 💬 **Chat with a Thai LLM** (llama2.c architecture, Q8_0 quantized, reads its config
+  entirely from the model file header — no recompile to swap models).
+  **คุยกับ LLM ภาษาไทย** (สถาปัตยกรรม llama2.c, Q8_0 — อ่าน config จาก header ของไฟล์
+  โมเดลล้วน ๆ สลับโมเดลได้โดยไม่ต้องคอมไพล์ใหม่)
+- ⌨️ **Type Thai** with the Kedmanee keyboard layout (`F1` toggles EN/TH), rendered to the
+  framebuffer with combining-mark handling.
+  **พิมพ์ภาษาไทย**ด้วยเลย์เอาต์เกษมณี (`F1` สลับ EN/TH) วาดลง framebuffer พร้อมจัดการ
+  สระ/วรรณยุกต์ซ้อน
+- 🖱️ **A real GUI** — mouse cursor, a chat window, slash commands, and input history.
+  **GUI จริง ๆ** — เคอร์เซอร์เมาส์ หน้าต่างแชท slash command และประวัติการพิมพ์
+- 🧠 **A 3-layer learning system**: verbatim knowledge-base lookup (`kb.txt`), an
+  "I don't know" answer instead of hallucinating, and an on-device `remember:` command
+  that survives reboot.
+  **ระบบเรียนรู้ 3 ชั้น**: ค้นคำตอบจาก knowledge base (`kb.txt`) แบบคำต่อคำ ตอบ
+  "ไม่ทราบ" แทนการมั่ว และคำสั่ง `จำไว้:` บนเครื่องที่จำได้ข้ามการรีบูต
+- 🎮 **Five games** drawn pixel-by-pixel to the framebuffer: Pac-Man, Snake, Tic-tac-toe,
+  Pong, and Tetris (`/games` picker).
+  **เกม 5 เกม**วาดทีละพิกเซลลง framebuffer: Pac-Man, Snake, XO, Pong และ Tetris
+  (เมนู `/games`)
+- 🔀 **Hot model switching** — `/listmodel` and `/loadmodel` let one USB carry many
+  domain models and swap between them at runtime.
+  **สลับโมเดลตอนรัน** — `/listmodel` + `/loadmodel` ให้ USB อันเดียวใส่โมเดลโดเมนได้
+  หลายตัวและสลับใช้ทันที
+
+---
+
+## Quick start · เริ่มต้นใช้งาน
+
+Requirements: macOS (or Linux) with `x86_64-w64-mingw32-gcc` (mingw-w64) and
+[gnu-efi](https://sourceforge.net/projects/gnu-efi/).
+
+ต้องการ: macOS (หรือ Linux) พร้อม `x86_64-w64-mingw32-gcc` (mingw-w64) และ
+[gnu-efi](https://sourceforge.net/projects/gnu-efi/)
+
+```bash
+make            # builds build/BOOTX64.EFI
+make install    # copies it to fat_usb/EFI/BOOT/BOOTX64.EFI
+```
+
+Then flash it to a USB drive (formats FAT32, copies the app + model + tokenizer, ejects):
+
+แล้วแฟลชลง USB (ฟอร์แมต FAT32 + copy ตัว app + โมเดล + tokenizer แล้ว eject):
+
+```bash
+./create_usb.sh /dev/diskX     # find your USB with: diskutil list
+# or, in Claude Code: /createboot /dev/diskX
+```
+
+Boot the USB in **UEFI mode** and pick the `UEFI:` entry.
+บูต USB ในโหมด **UEFI** แล้วเลือก entry `UEFI:`
+
+> ⚠️ `create_usb.sh` refuses to erase internal/system disks and requires you to type `YES`.
+> ⚠️ `create_usb.sh` ปฏิเสธการลบดิสก์ภายใน/ระบบ และต้องพิมพ์ `YES` ยืนยันก่อน
+
+---
+
+## Models · โมเดล
+
+All models are Q8_0-quantized `.bin` files read from the FAT32 root at boot. The default
+checkpoint is `stories15M_thai_q80.bin`; use `/loadmodel` to switch.
+
+โมเดลทั้งหมดเป็นไฟล์ `.bin` แบบ Q8_0 ที่อ่านจาก root ของ FAT32 ตอนบูต ตัว default คือ
+`stories15M_thai_q80.bin` — ใช้ `/loadmodel` เพื่อสลับ
+
+| File | What | QA accuracy |
+|------|------|-------------|
+| `stories15M_thai_q80.bin` | Thai factual-QA (general) | 14/14 |
+| `stories15M_thai_tourism_q80.bin` | Thai **tourism** domain model | 16/18 |
+| `stories15M_q80.bin` | English baseline (llama2.c `stories15M`) | — |
+
+Config (read from the header, no hardcoded dims): `dim=288 · 6 layers · 6 heads ·
+vocab=32000 · seq_len=256` ≈ **15M params**.
+
+Config (อ่านจาก header ไม่ hardcode dim): `dim=288 · 6 เลเยอร์ · 6 heads · vocab=32000 ·
+seq_len=256` ≈ **15M พารามิเตอร์**
+
+### The "domain model library" approach · แนวคิด "ห้องสมุดโมเดลเฉพาะทาง"
+
+Instead of one big expensive model, the project accumulates **many small 15M
+domain-specific models** (tourism, storytelling, math tutor, …) and lets you pick one at
+runtime. Each is ~17 MB, so a 1 GB USB holds dozens. See
+[`PROTOTYPE.md`](PROTOTYPE.md) for the scaling/budget rationale (15M → 110M → 7B).
+
+แทนที่จะเทรนโมเดลใหญ่ตัวเดียว โปรเจกต์นี้สะสม **โมเดล 15M เฉพาะทางหลายตัว** (ท่องเที่ยว,
+นิทาน, สอนคณิต, …) แล้วเลือกใช้ตอนรัน แต่ละตัว ~17 MB → USB 1 GB ใส่ได้หลายสิบตัว
+ดูเหตุผลเรื่อง scale/งบใน [`PROTOTYPE.md`](PROTOTYPE.md) (15M → 110M → 7B)
+
+---
+
+## Training your own model · เทรนโมเดลเอง
+
+The full pipeline is documented in [`TRAIN_THAI.md`](TRAIN_THAI.md) (Thai). In short:
+pipeline ทั้งหมดอยู่ใน [`TRAIN_THAI.md`](TRAIN_THAI.md) สรุปสั้น ๆ:
+
+```bash
+# 1. Build a corpus (streams Thai Wikipedia)
+tools/venv/bin/python tools/build_thai_corpus.py --limit-mb 500
+# 2. Clean it
+tools/venv/bin/python tools/clean_thai_corpus.py thai_corpus_500.txt
+# 3. Tokenize -> uint16 train.bin / val.bin
+tools/venv/bin/python tools/prep_thai.py
+# 4. Train (MPS float32; 15M runs on an 8 GB Mac)
+cd llama2c && ../tools/venv/bin/python train.py --device=mps --dtype=float32 ...
+# 5. Export to Q8_0 v2 .bin
+../tools/venv/bin/python export.py stories15M_thai_new_q80.bin --version 2 --checkpoint out/ckpt.pt
+```
+
+A domain model is the same thing plus a curated Q&A facts file (see
+`tourism_qa.txt` and `tools/build_tourism_corpus.py`).
+โมเดลโดเมนคือของเดียวกันบวกไฟล์ Q&A ข้อเท็จจริงที่คัดมา (ดู `tourism_qa.txt` และ
+`tools/build_tourism_corpus.py`)
+
+---
+
+## Project structure · โครงสร้างโปรเจกต์
+
+| Path | Purpose |
 |------|---------|
-| `run.c` | The full bare-metal port (no `<stdio.h>`, `<stdlib.h>`, `<math.h>`, `<string.h>`, `<time.h>`, `<unistd.h>`; only `<efi.h>` + `<efilib.h>`) |
+| `run.c` | The entire bare-metal port (freestanding; only `<efi.h>` + `<efilib.h>`) |
 | `Makefile` | mingw-w64 + gnu-efi cross-compile recipe |
-| `build/BOOTX64.EFI` | Built image (also copied to `fat_usb/EFI/BOOT/BOOTX64.EFI`) |
-| `stories15M.bin` | Model checkpoint (from llama2.c) |
-| `tokenizer.bin` | Tokenizer (from llama2.c) |
+| `create_usb.sh` | Format + copy + eject a bootable USB |
+| `sync_models.sh` | Copy `*_q80.bin` models into `fat_usb/` (auto-run by `create_usb.sh`) |
+| `llama2c/` | Training/export code (`train.py`, `export.py`, `model.py`) |
+| `tools/` | Corpus builder/cleaner, tokenizer, KB builder, QEMU test harness |
+| `fat_usb/` | Staging directory that mirrors the USB layout |
+| `kb.txt` | Knowledge-base facts (built from `qa_thai_all.txt` by `tools/build_kb.py`) |
 
 ---
 
-## The four deliverables
+## How it works (technical notes) · เบื้องหลังการทำงาน
 
-### 1. Custom math (freestanding, no `-lm`)
+**No libc.** Every dependency is reimplemented in `run.c`:
+**ไม่มี libc** — ทุก dependency เขียนใหม่เองใน `run.c`:
 
-All implemented directly in `run.c`:
+- `expf`/`sqrtf`/`sinf`/`cosf` are hand-written (Taylor series + Newton–Raphson + IEEE-754
+  bit tricks); `powf` is removed entirely — the single RoPE frequency becomes
+  `expf(-(head_dim/head_size) * ln(10000))`.
+  `expf`/`sqrtf`/`sinf`/`cosf` เขียนเอง (อนุกรม Taylor + Newton–Raphson + bit-trick IEEE-754);
+  ตัด `powf` ทิ้งทั้งหมด — ความถี่ RoPE ตัวเดียวเปลี่ยนเป็น `expf(-(head_dim/head_size) * ln(10000))`
+- **No AVX** — `-mavx`/`-march=native` are forbidden because UEFI never enables `XCR0`,
+  so AVX would fault. The image stays on the x86-64 SSE2 baseline.
+  **ห้ามใช้ AVX** — เพราะ UEFI ไม่เปิด `XCR0` ทำให้ AVX fault ภาพทั้งหมดจึงอยู่บน baseline SSE2
+- File I/O goes through the UEFI `SIMPLE_FILE_SYSTEM_PROTOCOL`; weights are page-allocated
+  with `AllocatePages`, the tokenizer with `AllocatePool`.
+  อ่านไฟล์ผ่าน `SIMPLE_FILE_SYSTEM_PROTOCOL` ของ UEFI; น้ำหนักโมเดล allocate แบบ page ด้วย
+  `AllocatePages` ส่วน tokenizer ใช้ `AllocatePool`
+- `efi_main` replaces `main()`; `InitializeLib(...)` is called first.
+  `efi_main` แทนที่ `main()` และเรียก `InitializeLib(...)` ก่อนเสมอ
 
-| Function | Technique |
-|----------|-----------|
-| `expf(x)` | Horner-evaluated Taylor series for the integer part + IEEE-754 bit-trick for the fractional part (`efi_pow2` scales `x / ln 2` into the exponent field). Range-clamped to avoid overflow/denormals. |
-| `sqrtf(x)` | Newton–Raphson, seeded with `(bits >> 1) + 0x1FC00000`. |
-| `sinf(x)` / `cosf(x)` | `efi_reduce_pi` range-reduction into `[-π/2, π/2]`, then Taylor series. |
-
-`powf` is **removed entirely**. The only RoPE frequency that used it —
-
-```c
-freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-```
-
-— becomes
-
-```c
-freq = expf(-(head_dim / (float)head_size) * 9.210340371976184f);  /* ln(10000) */
-```
-
-**Constraint:** no AVX. `-mavx` / `-march=native` are forbidden because UEFI never enables
-XCR0, so AVX instructions would fault. The whole image stays on the x86-64 SSE2 baseline.
-
----
-
-### 2. UEFI file reading
-
-`read_file()` reads `stories15M.bin` and `tokenizer.bin` from the FAT32 root into RAM:
-
-1. `HandleProtocol(ImageHandle, LOADED_IMAGE_PROTOCOL)` → `li->DeviceHandle`
-2. `HandleProtocol(li->DeviceHandle, SIMPLE_FILE_SYSTEM_PROTOCOL)` → `EFI_FILE_IO_INTERFACE`
-3. `OpenVolume` → root `EFI_FILE_HANDLE`
-4. `Open(root, &f, L"\\stories15M.bin", EFI_FILE_MODE_READ, 0)`
-5. `GetInfo(f, EFI_FILE_INFO_ID, ...)` → file size
-6. `AllocatePages` (26 MB checkpoint) or `AllocatePool` (tokenizer) → `Read` in a loop to EOF
-
-The GUIDs are **local `EFI_GUID` initializers** (not references to gnu-efi's `lib/guid.c`
-symbols). Protocol call argument counts:
-
-```
-Open=5   Close=1   Read=3   GetInfo=4
-HandleProtocol=3   OpenVolume=2   AllocatePages=4   FreePages=2
-```
-
----
-
-### 3. Main loop + memory allocation
-
-- `efi_main(EFI_HANDLE, EFI_SYSTEM_TABLE*)` replaces `main()`, calls `InitializeLib(...)` first.
-- `malloc_run_state` / `free_run_state` use `AllocateZeroPool` / `FreePool` (small `RunState` buffers).
-- Checkpoint weights are page-allocated via `AllocatePages` and freed with `FreePages`
-  (page count `= (size + 4095) / 4096`, matching the allocation in `read_file`).
-- Tokenizer buffer uses `AllocatePool` / `FreePool`.
-- The transformer build, `memory_map_weights`, `forward`, and sampler logic are
-  algorithmically identical to Karpathy's, but use `memcpy`-based buffer reads instead of
-  `mmap`/`fread`, and `efi_qsort`/`efi_bsearch` instead of `qsort`/`bsearch`.
-- `decode()` hand-parses `<0xNN>` byte escapes (no `sscanf`); `encode()` uses
-  `strcpy`/`strcat` (no `sprintf`); output via `Print(L"%a", piece)`.
-- `generate()` accepts a `char *prompt` and feeds it to `encode()` as the starting tokens.
-- **Interactive prompting:** `read_line(SystemTable->ConIn, buf, max)` waits on
-  `ConIn->ReadKeyStroke`, echoes printable ASCII, handles Backspace (`\b \b` erase), and
-  returns on Enter. `efi_main` loops asking `"Enter prompt (empty to quit): "`, generates,
-  and repeats until an empty line.
-- **Thai input (Kedmanee):** `F1` toggles an EN/TH mode; in TH mode each US key maps to a
-  Thai codepoint via `gKedmanee[128]`, encoded to UTF-8 and rendered through
-  `fb_put_codepoint` (with zero-width combining-mark handling). Backspace deletes a whole
-  multi-byte codepoint. See [`USAGE_THAI.md`](USAGE_THAI.md) for the full key table,
-  small-model setup, and QEMU testing.
-
----
-
-### 4. Makefile / compile command
+**Cross-compile flags** (all required for a clean mingw + gnu-efi build):
+**แฟล็ก cross-compile** (จำเป็นทั้งหมดเพื่อให้ mingw + gnu-efi บิลด์ผ่าน):
 
 ```makefile
 CC      = x86_64-w64-mingw32-gcc
 CFLAGS  = -O3 -Wall -ffreestanding -fno-stack-protector -fno-builtin \
           -DGNU_EFI_USE_MS_ABI -Ignu-efi/inc -Ignu-efi/inc/protocol
 LDFLAGS = -nostdlib -Wl,--subsystem,10 -Wl,--entry,efi_main -Wl,--dynamicbase
-LIBS    = -lgcc
 ```
 
-Key decisions (all required for a clean mingw + gnu-efi build):
+**Gotcha — gnu-efi `Print` format widths:** `%u`/`%d` read 32-bit values; for 64-bit use
+`%lu`/`%ld`. `%a` = `CHAR8*`, `%s` = `CHAR16*`, `%r` = `EFI_STATUS`.
+**ข้อควรระวัง — ความกว้าง format ของ `Print`:** `%u`/`%d` อ่านค่า 32-bit; ค่า 64-bit ต้องใช้
+`%lu`/`%ld` · `%a` = `CHAR8*`, `%s` = `CHAR16*`, `%r` = `EFI_STATUS`
 
-- **`-DGNU_EFI_USE_MS_ABI`** — mingw already uses the MS x64 ABI, so `EFIAPI` collapses to
-  `__attribute__((ms_abi))` and `uefi_call_wrapper` to a direct call. This is why
-  `callwrap.c` is **excluded** (it is a SysV→MS thunk).
-- **No `-fshort-wchar`** — mingw's `wchar_t` is already 16-bit, so `L"..."` matches `CHAR16`.
-- **`entry.c` excluded** — it is an ELF `_start`; PE/COFF uses `--entry,efi_main` instead.
-- **`--dynamicbase`** emits `.reloc` so firmware can rebase the image.
-- gnu-efi objects: `lib/*.c` (minus `entry.c`, `callwrap.c`), `lib/x86_64/{initplat,math}.c`,
-  and `lib/runtime/{efirtlib,rtdata,rtlock,rtstr}.c` (minus `vm.c`).
-
----
-
-## Build & install
-
-```bash
-make            # builds build/BOOTX64.EFI
-make install    # copies it to fat_usb/EFI/BOOT/BOOTX64.EFI
-make clean
-```
+**Verified image:** PE32+ (`0x020b`), subsystem `0x0a` (EFI application), `.reloc` present,
+empty import table (no DLL deps).
+**ตรวจสอบแล้ว:** PE32+ (`0x020b`), subsystem `0x0a` (EFI application), มี `.reloc`, import
+table ว่าง (ไม่พึ่ง DLL)
 
 ---
 
-## Deploy to hardware
+## Documentation · เอกสาร
 
-Run `/createboot <disk>` in Claude Code (or `sudo ./create_usb.sh <disk>`): the script
-formats the USB as FAT32, copies `BOOTX64.EFI`, the model `.bin`, `tokenizer.bin` and
-`kb.txt`, then ejects it. Boot the USB in **UEFI mode**.
+Some docs are in Thai (the project's working language):
+เอกสารส่วนใหญ่เป็นภาษาไทย (ภาษาที่ใช้ทำงานของโปรเจกต์):
 
----
-
-## Games
-
-Besides chatting with the model, `BOOTX64.EFI` ships five classic games drawn directly to
-the framebuffer (no sprite library — every pixel is written by hand):
-
-| Game | Command | Controls |
-|------|---------|----------|
-| Pac-Man | `/games pacman [auto]` | Arrows / WASD to steer · Q/ESC to quit · `auto` lets the AI play |
-| Snake | `/games snake` | Arrows / WASD to turn · first press starts · Q/ESC to quit |
-| XO (Tic-tac-toe) | `/games xo` / `tic` | Arrows to move + Enter to place X (vs. AI) |
-| Pong | `/games pong` | W/S or ↑/↓ to move the paddle (vs. AI) |
-| Tetris | `/games tetris` | ←/→ move · ↑ rotate · ↓ soft drop · Space hard drop · Q/ESC quit |
-
-Type `/games` with no argument to open a picker dropdown (↑/↓ to move, Enter to start, ESC
-to cancel). See [`GUIDE_THAI.md`](GUIDE_THAI.md) for the Thai guide.
+| Doc | Language | Covers |
+|-----|----------|--------|
+| [`USAGE_THAI.md`](USAGE_THAI.md) | 🇹🇭 Thai | Usage, Kedmanee key table, QEMU testing |
+| [`GUIDE_THAI.md`](GUIDE_THAI.md) | 🇹🇭 Thai | Overall Thai-language guide |
+| [`TRAIN_THAI.md`](TRAIN_THAI.md) | 🇹🇭 Thai | Training pipeline in detail |
+| [`COMMANDS_THAI.md`](COMMANDS_THAI.md) | 🇹🇭 Thai | Slash commands |
+| [`PROTOTYPE.md`](PROTOTYPE.md) | 🇹🇭 Thai | Status, roadmap, scaling/budget decisions |
+| [`PENDING.md`](PENDING.md) | 🇹🇭 Thai | Open tasks / notes |
 
 ---
 
-## Verified image properties
+## License · สัญญาอนุญาต
 
-```
-file format:      pei-x86-64
-architecture:     i386:x86-64
-Magic:            020b (PE32+)
-Subsystem:        0000000a (EFI application)
-.reloc:           present (via --dynamicbase)
-import table:     empty (no DLL dependencies)
-```
-
----
-
-## Gotcha: gnu-efi `Print` format widths
-
-`%u` reads a **32-bit** `UINT32`, not `UINTN`. For 64-bit values use `%lu` / `%ld`.
-
-| Specifier | Reads | Example |
-|-----------|-------|---------|
-| `%a` | `CHAR8*` (ASCII) | `Print(L"%a", ascii_str)` |
-| `%s` | `CHAR16*` (wide) | `Print(L"%s", L"wide")` |
-| `%d` / `%u` | 32-bit `INT32` / `UINT32` | `Print(L"%d", 42)` |
-| `%ld` / `%lu` | 64-bit `INT64` / `UINT64` | `Print(L"%lu", checkpoint_size)` |
-| `%r` | `EFI_STATUS` | `Print(L"status=%r", st)` |
-| `%p` | pointer | `Print(L"%p", ptr)` |
-| `%c` | `UINTN` | |
-| `%g` | `EFI_GUID*` | |
-
----
-
-## Next steps (not yet done)
-
-- Optional: `AllocatePages` with `AllocateMaxAddress` below 4 GiB if running on 32-bit-only
-  firmware (not needed for x64).
-- Clean up the temporary `hello_efi.c` smoke-test file.
+[MIT](LICENSE) — © 2026 rachatarath. Fork it, extend it, ship it.
+[MIT](LICENSE) — © 2026 rachatarath. เอาไป fork ต่อยอด ปล่อยต่อได้เลย
