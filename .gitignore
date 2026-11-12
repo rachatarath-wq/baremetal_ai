@@ -21,9 +21,11 @@ __pycache__/
 
 # Training data & checkpoints (regenerable)
 /data/
+/data_*/
 /llama2c/out_thai*/
 /thai_corpus*.txt
 /thai_qa.txt
+/*_qa_repeated.txt
 /kb.txt
 
 # Large binaries / backups / archives
