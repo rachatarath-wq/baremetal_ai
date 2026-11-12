@@ -102,7 +102,7 @@ tools/venv/bin/python tools/qemu_type.py /tmp/qemu_bm.sock \
   --start-mode en --th "พ่อเราชื่ออะไร" --shot /tmp/shot.ppm
 ```
 
-**คาดหวัง**: `คุณรชต รัตนวสวัต , rachata.rath@gmail.com` (ข้อความเดียวกับ `kb.txt`)
+**คาดหวัง**: `ผู้พัฒนา , contact@example.com` (ข้อความเดียวกับ `kb.txt`)
 
 ### 4.2 ชั้น 2 — ไม่รู้ → ตอบ "ไม่ทราบ"
 
@@ -179,7 +179,7 @@ tools/venv/bin/python tools/qemu_type.py /tmp/qemu_bm.sock \
 ```
 kb: 225 entries loaded (41357 bytes)      ← บูตแรก
 Enter prompt [EN] ... [TH]พ่อเราชื่ออะไร
-คุณรชต รัตนวสวัต , rachata.rath@gmail.com  ← ชั้น 1 ✓
+ผู้พัฒนา , contact@example.com  ← ชั้น 1 ✓
 Enter prompt [TH] ... [TH]ทำไมท้องฟ้าถึงเป็นสีฟ้า
 ไม่ทราบ                                   ← ชั้น 2 ✓
 Enter prompt [TH] ... จำไว้: ดาวพุธมีสีอะไร = สีเหลือง
