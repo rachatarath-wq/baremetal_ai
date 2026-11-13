@@ -200,8 +200,10 @@ static EFI_FILE_HANDLE open_root_volume(EFI_HANDLE ImageHandle) {
 
 /* Read the whole file `name` (relative to `root`) into a freshly allocated
  * buffer.  Returns EFI_SUCCESS on success and sets *out / *out_size.
- * want_pages selects AllocatePages (page-aligned, for the 60 MB weights)
- * versus AllocatePool (for the ~400 KB tokenizer). */
+ * want_pages selects AllocatePages (page-aligned) versus AllocatePool.
+ * The checkpoint is loaded with want_pages=0 (AllocatePool): freeing a large
+ * AllocatePages block with BS->FreePages hangs OVMF (infinite loop in
+ * CoreConvertPages), so models no longer use the page allocator. */
 static EFI_STATUS read_file(EFI_FILE_HANDLE root, CHAR16 *name,
                             int want_pages, VOID **out, UINTN *out_size) {
     EFI_STATUS status;
@@ -506,8 +508,12 @@ void free_transformer(Transformer* t) {
     FreePool(t->weights.w2);
     FreePool(t->weights.w3);
     if (t->weights.wcls != t->weights.q_tokens) FreePool(t->weights.wcls);
+    /* The checkpoint is now read with AllocatePool (see read_file), so it is
+     * released with FreePool.  Freeing a large AllocatePages block with
+     * BS->FreePages hangs OVMF (infinite loop in CoreConvertPages), so the
+     * checkpoint no longer uses the page allocator at all. */
     if (t->data != NULL) {
-        uefi_call_wrapper(BS->FreePages, 2, (UINTN)t->data, EFI_SIZE_TO_PAGES(t->data_size));
+        FreePool(t->data);
         t->data = NULL;
     }
 }
@@ -3133,10 +3139,13 @@ static void gui_repaint_input(void) {
 }
 
 static void gui_repaint_chat(void) {
+    /* Full desktop repaint, not just chat+input+emotion.  Overlay screens (song
+     * viewer / picker / editor) draw their own full-screen or bottom-strip text
+     * (e.g. the song viewer's "E แก้  Del ลบ  Esc กลับ" footer, which sits in
+     * the same band as the input box + Send button).  A partial repaint here
+     * would leave that text behind, so clear the whole framebuffer first. */
     mouse_restore();
-    gui_draw_chat();
-    gui_draw_input();
-    gui_draw_emotion();
+    gui_draw_desktop();
     gui_refresh_cursor();
 }
 
@@ -3312,18 +3321,23 @@ static void load_new_model(const char *filename) {
         return;
     }
     gui_chat_add2("> loading model: ", filename);
+    /* The load below is fully synchronous (read whole checkpoint + dequantize +
+     * build run state) and can take a few seconds on a slow FAT32 volume.  Paint
+     * the "loading..." line now so the screen doesn't look frozen while it runs. */
+    gui_repaint_chat();
 
     VOID *data = NULL;
     UINTN size = 0;
-    EFI_STATUS st = read_file(gRoot, path, 1, &data, &size);
+    EFI_STATUS st = read_file(gRoot, path, 0, &data, &size);
     if (EFI_ERROR(st) || data == NULL) {
         gui_chat_add("> error: could not read checkpoint");
         return;
     }
 
     Transformer next;
-    if (build_transformer(&next, data, size) != 0) {
-        uefi_call_wrapper(BS->FreePages, 2, (UINTN)data, EFI_SIZE_TO_PAGES(size));
+    int btr = build_transformer(&next, data, size);
+    if (btr != 0) {
+        FreePool(data);
         gui_chat_add("> error: invalid model checkpoint");
         return;
     }
@@ -6784,10 +6798,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         return EFI_LOAD_ERROR;
     }
 
-    // read the checkpoint into page-aligned memory (AllocatePages; see read_file)
+    // read the checkpoint into pool memory (see read_file: FreePages hangs OVMF)
     VOID *checkpoint_data = NULL;
     UINTN checkpoint_size = 0;
-    status = read_file(root, checkpoint_name, 1, &checkpoint_data, &checkpoint_size);
+    status = read_file(root, checkpoint_name, 0, &checkpoint_data, &checkpoint_size);
     if (EFI_ERROR(status) || checkpoint_data == NULL) {
         fb_printf("error: could not read %s (status 0x%lx)\n",
                   checkpoint_name, (UINT64)status);
