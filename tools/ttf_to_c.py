@@ -110,6 +110,16 @@ def index_of(cp):
     return -1
 
 
+# Code points the app never renders but that are abnormally wide in the fonts we
+# target, so they are excluded from the width constraint rather than shrinking
+# every glyph (and with it every Thai character) to fit them:
+#   '%'  U+0x25   ~0.90em   (only appears inside fb_printf format strings)
+#   '@'  U+0x40   ~0.80em   (no @ in the UI)
+#   ๚    U+0xE5A  ~0.77em   Thai poetic mark, never printed
+#   ๛    U+0xE5B  ~1.02em   Thai "khomut" end-of-section mark, never printed
+UNUSED_WIDE = (0x25, 0x40, 0x0E5A, 0x0E5B)
+
+
 # --------------------------------------------------------------------------- #
 # Font size auto-fit.
 #
@@ -130,12 +140,17 @@ def fit_font(path, index, cell_w, cell_h, baseline):
             size -= 1
             continue
         asc, desc = f.getmetrics()
-        # Use the Thai consonant advance as the representative text advance.
-        # Thai consonants, digits and lowercase Latin all share this width in
-        # the fonts we target.  The only outliers are the wide uppercase letters
-        # ('M'/'W' are ~1.0x the em), which are left to clip gracefully at the
-        # cell edge rather than shrinking the whole font down to fit them.
-        adv = f.getlength("ก")   # U+0E01 KO KAI
+        # Width constraint: the widest *spacing* glyph we emit must fit the cell,
+        # so nothing the user actually sees gets clipped.  The old code measured
+        # only Thai 'ก' (~0.58em); that left the wide Latin 'm'/'w'/'M'/'W' and
+        # the wide Thai consonants ฌ/ญ/ฒ/ณ (~0.83em) with their right stem cut
+        # off at the cell edge (e.g. "m" lost its third stem).  UNUSED_WIDE marks
+        # are skipped as they never appear on screen.
+        adv = max(
+            f.getlength(chr(cp))
+            for cp in code_points()
+            if not is_thai_combining(cp) and cp not in UNUSED_WIDE
+        )
         if asc <= baseline and desc <= cell_h - baseline and adv <= cell_w:
             return f, size, asc, desc, adv
         last = (f, size, asc, desc, adv)
@@ -311,13 +326,15 @@ def main(argv):
               % (cell_w, cell_h, baseline, asc, desc, max_adv), file=sys.stderr)
 
     # Horizontal placement.  `mono_adv` is the Thai consonant advance (the grid
-    # pitch for this monospaced layout); spacing glyphs are centred by it, and a
-    # single shared shift preserves mark<->consonant alignment.
+    # pitch used to position zero-width combining marks over a consonant), and a
+    # single shared shift preserves mark<->consonant alignment.  Spacing glyphs
+    # are centred by the *widest* glyph (max_adv from fit_font) so that the wide
+    # 'm'/'W'/ญ/ณ glyphs fit the cell instead of being pushed right and clipped.
     mono_adv = int(round(font.getlength("ก")))   # U+0E01 KO KAI
     if args.no_center:
         x_shift = 0
     else:
-        x_shift = max(0, (cell_w - mono_adv) // 2)
+        x_shift = max(0, (cell_w - int(round(max_adv))) // 2)
 
     glyphs = []
     blanks = []
