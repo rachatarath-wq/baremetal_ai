@@ -1709,6 +1709,13 @@ static EFI_STATUS init_gop(void) {
 #define KBD_SCAN_UP    0x01
 #define KBD_SCAN_DOWN  0x02
 
+/* EFI scan codes for cursor movement / editing inside the input box. */
+#define KBD_SCAN_RIGHT  0x03
+#define KBD_SCAN_LEFT   0x04
+#define KBD_SCAN_HOME   0x05
+#define KBD_SCAN_END    0x06
+#define KBD_SCAN_DELETE 0x08
+
 /* ESC, used to cancel the model-picker drop-down. */
 #define KBD_SCAN_ESC   0x17
 
@@ -2389,6 +2396,7 @@ static GuiRect gChatBox, gInputBox, gSendButton, gStatusBar;
 
 static char gInputBuf[GUI_INPUT_LEN];
 static int  gInputLen = 0;
+static int  gCaretPos = 0;           /* byte offset of the insertion point     */
 
 static int    gCaretVisible = 1;     /* input caret on/off (blinks while idle) */
 static UINT32 gCaretAccumUs = 0;      /* caret blink accumulator, microseconds  */
@@ -2833,6 +2841,83 @@ static void gui_draw_send_button(void) {
     gui_text(tx, ty, label, gColButtonFg, gColButtonBg);
 }
 
+/* ----------------------------------------------------------------------------
+ * UTF-8 / grapheme editing helpers for the input caret.
+ * ------------------------------------------------------------------------- */
+
+/* Byte offset of the code point that ends just before `pos` (step the caret one
+ * code point to the left).  `pos` must already be on a code-point boundary. */
+static int utf8_prev(const char *s, int pos) {
+    while (pos > 0 && ((unsigned char)s[pos - 1] & 0xC0) == 0x80) pos--;
+    return pos - 1;
+}
+
+/* Byte offset one code point past `pos` (step the caret right). */
+static int utf8_next(const char *s, int pos) {
+    pos++;
+    while (s[pos] && ((unsigned char)s[pos] & 0xC0) == 0x80) pos++;
+    return pos;
+}
+
+/* True when `cp` is drawn zero-width (a Thai combining mark), so it occupies no
+ * cell of its own and should travel with its base consonant. */
+static int cp_zero_width(UINT32 cp) {
+    const HRFONT_glyph_t *g = hrf_lookup(cp);
+    return (g != NULL && g->adv == 0);
+}
+
+/* Decode the code point starting at s[pos] (pos must be on a boundary). */
+static UINT32 cp_at(const char *s, int pos) {
+    const char *p = s + pos;
+    return hrf_decode_utf8(&p);
+}
+
+/* Caret movement treats a base consonant plus its trailing combining marks as a
+ * single unit, so the caret never lands inside a Thai syllable.  Both return a
+ * byte offset that is always on a code-point boundary. */
+static int grapheme_prev(const char *s, int pos) {
+    if (pos <= 0) return 0;
+    int p = utf8_prev(s, pos);                 /* last code point before caret  */
+    while (p > 0 && cp_zero_width(cp_at(s, p))) {
+        p = utf8_prev(s, p);                   /* skip back over combining marks */
+    }
+    return p;
+}
+
+static int grapheme_next(const char *s, int len, int pos) {
+    if (pos >= len) return len;
+    int p = utf8_next(s, pos);                 /* first code point after caret  */
+    while (p < len && cp_zero_width(cp_at(s, p))) {
+        p = utf8_next(s, p);                   /* skip forward over combining marks */
+    }
+    return p;
+}
+
+/* Encode a code point as UTF-8; returns the byte count (1..3). */
+static int cp_to_utf8(UINT32 cp, char out[4]) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    out[0] = (char)(0xE0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+}
+
+/* Insert `n` bytes at `pos`, shifting the tail right.  Returns 1 on success, 0
+ * if it would overflow max_len (which includes the terminating NUL). */
+static int buf_insert(char *buf, int *len, int pos, const char *src, int n,
+                      int max_len) {
+    if (n <= 0 || *len + n > max_len - 1) return 0;
+    memmove(buf + pos + n, buf + pos, (UINTN)(*len - pos + 1));  /* + NUL */
+    for (int i = 0; i < n; i++) buf[pos + i] = src[i];
+    *len += n;
+    return 1;
+}
+
 /* Column the input caret sits in: count spacing glyphs in gInputBuf so that
  * Thai combining marks (zero-width) do not shift the caret. */
 static int gui_input_cells(void) {
@@ -2870,6 +2955,18 @@ static const char *gui_skip_cells(const char *s, int skip) {
     return p;
 }
 
+/* Count spacing glyphs in gInputBuf[0..pos) — the caret's cell column. */
+static int gui_input_cells_upto(int pos) {
+    const char *p = gInputBuf;
+    int cells = 0;
+    while (p < gInputBuf + pos) {
+        UINT32 cp = hrf_decode_utf8(&p);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv != 0) cells++;
+    }
+    return cells;
+}
+
 static void gui_draw_input(void) {
     draw_filled_rect(gInputBox.x, gInputBox.y, gInputBox.w, gInputBox.h, gColInputBg);
     draw_rect(gInputBox.x, gInputBox.y, gInputBox.w, gInputBox.h, gColBorder);
@@ -2877,20 +2974,27 @@ static void gui_draw_input(void) {
     /* language-mode chip, then the text being typed */
     gui_text(gInputBox.x + GUI_PAD, ty, gThaiMode ? "TH" : "EN", gColAccent, gColInputBg);
 
-    /* Scroll long input to its tail so it never spills past the input box. */
+    /* Scroll a long input so the caret stays visible inside the box: pick the
+     * first cell (column) to show, then draw the substring from there. */
     int tx   = gInputBox.x + GUI_PAD + 3 * HRFONT_W;   /* text/caret start x */
     int maxc = (gInputBox.w - 2 * GUI_PAD - 3 * HRFONT_W) / HRFONT_W;
     if (maxc < 1) maxc = 1;
     int total = gui_input_cells();
-    int shown = total < maxc ? total : maxc;
-    const char *view = (total > maxc) ? gui_skip_cells(gInputBuf, total - maxc)
-                                      : gInputBuf;
+    int caret = gui_input_cells_upto(gCaretPos);
+
+    int start = 0;                       /* first visible cell column           */
+    if (total > maxc) {
+        start = caret - maxc + 1;        /* keep the caret on the last column   */
+        if (start < 0) start = 0;
+        if (start > total - maxc) start = total - maxc;   /* clamp near the tail */
+    }
+    const char *view = (start > 0) ? gui_skip_cells(gInputBuf, start) : gInputBuf;
     gui_text(tx, ty, view, gColText, gColInputBg);
 
-    /* blinking text cursor just past the visible text, so it is always on box */
+    /* blinking caret bar at the insertion point (a column, not a byte offset) */
     if (gCaretVisible) {
-        int cx = tx + shown * HRFONT_W;
-        if (cx + CARET_W <= gInputBox.x + gInputBox.w - 4)
+        int cx = tx + (caret - start) * HRFONT_W;
+        if (cx >= tx && cx + CARET_W <= gInputBox.x + gInputBox.w - 4)
             draw_filled_rect(cx, ty, CARET_W, HRFONT_H, gColText);
     }
 }
@@ -2980,6 +3084,7 @@ static void gui_history_prev(void) {
     }
     strcpy(gInputBuf, gHistory[gHistoryIndex]);
     gInputLen = (int)strlen(gInputBuf);
+    gCaretPos = gInputLen;   /* caret to the end of the recalled line */
 }
 
 /* Recall newer prompts / restore the draft line (DOWN arrow). */
@@ -2993,6 +3098,7 @@ static void gui_history_next(void) {
         strcpy(gInputBuf, gDraft);
     }
     gInputLen = (int)strlen(gInputBuf);
+    gCaretPos = gInputLen;   /* caret to the end of the recalled line */
 }
 
 /* ----------------------------------------------------------------------------
@@ -4811,6 +4917,7 @@ static int gui_is_greeting(const char *s) {
 static void gui_chat_show_usage(void) {
     gui_chat_add("คู่มือวิธีใช้:");
     gui_chat_add("> F1 สลับพิมพ์ภาษาไทย / อังกฤษ");
+    gui_chat_add("> ← → เลื่อนเคอร์เซอร์  Backspace/Delete ลบตัวอักษร");
     gui_chat_add("> พิมพ์คำถาม แล้วกด Enter เพื่อถาม AI");
     gui_chat_add("> จำไว้: คำถาม = คำตอบ  เพื่อสอนความรู้ใหม่");
     gui_chat_add("> /games pacman  เล่นเกมแพคแมน");
@@ -4871,6 +4978,7 @@ static void gui_send(void) {
 
     gInputLen = 0;
     gInputBuf[0] = '\0';
+    gCaretPos = 0;
     if (gGameMode == GAME_MODE_NONE && !gPickerOn)
         gui_repaint_chat();   /* also repaints the now-empty input box */
 }
@@ -4911,16 +5019,52 @@ static void gui_handle_key(EFI_INPUT_KEY key) {
 
     if (ch == CHAR_CARRIAGE_RETURN) { gui_send(); return; }
 
+    /* ---- cursor movement ---- */
+    if (key.ScanCode == KBD_SCAN_LEFT) {
+        gCaretPos = grapheme_prev(gInputBuf, gCaretPos);
+        gui_repaint_input();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_RIGHT) {
+        gCaretPos = grapheme_next(gInputBuf, gInputLen, gCaretPos);
+        gui_repaint_input();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_HOME) {
+        gCaretPos = 0;
+        gui_repaint_input();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_END) {
+        gCaretPos = gInputLen;
+        gui_repaint_input();
+        return;
+    }
+
+    /* Backspace: delete the grapheme (base char + marks) before the caret. */
     if (ch == CHAR_BACKSPACE) {
-        if (gInputLen > 0) {
-            gHistoryIndex = -1;                 /* editing leaves history browsing */
-            /* remove one full UTF-8 character (Thai chars are 3 bytes) */
-            gInputLen--;
-            gInputBuf[gInputLen] = '\0';
-            while (gInputLen > 0 && ((unsigned char)gInputBuf[gInputLen - 1] & 0xC0) == 0x80) {
-                gInputLen--;
-                gInputBuf[gInputLen] = '\0';
-            }
+        gHistoryIndex = -1;                 /* editing leaves history browsing */
+        int start = grapheme_prev(gInputBuf, gCaretPos);
+        if (start < gCaretPos) {
+            int n = gCaretPos - start;
+            memmove(gInputBuf + start, gInputBuf + gCaretPos,
+                    (UINTN)(gInputLen - gCaretPos + 1));   /* + NUL */
+            gInputLen -= n;
+            gCaretPos = start;
+            gui_repaint_input();
+        }
+        return;
+    }
+
+    /* Delete: remove the grapheme at (or just after) the caret. */
+    if (key.ScanCode == KBD_SCAN_DELETE) {
+        gHistoryIndex = -1;
+        int end = grapheme_next(gInputBuf, gInputLen, gCaretPos);
+        if (end > gCaretPos) {
+            int n = end - gCaretPos;
+            memmove(gInputBuf + gCaretPos, gInputBuf + end,
+                    (UINTN)(gInputLen - end + 1));         /* + NUL */
+            gInputLen -= n;
             gui_repaint_input();
         }
         return;
@@ -4931,13 +5075,18 @@ static void gui_handle_key(EFI_INPUT_KEY key) {
 
     gHistoryIndex = -1;                       /* typing leaves history browsing */
 
+    /* Insert a full code point at the caret, never splitting a UTF-8 sequence. */
     if (gThaiMode) {
         UINT32 cp = gKedmanee[(unsigned char)ch];
         if (cp == 0) cp = (UINT32)ch;
-        append_utf8(gInputBuf, &gInputLen, GUI_INPUT_LEN, cp);
-    } else if (gInputLen < GUI_INPUT_LEN - 1) {
-        gInputBuf[gInputLen++] = (char)ch;
-        gInputBuf[gInputLen] = '\0';
+        char enc[4];
+        int n = cp_to_utf8(cp, enc);
+        if (buf_insert(gInputBuf, &gInputLen, gCaretPos, enc, n, GUI_INPUT_LEN))
+            gCaretPos += n;
+    } else {
+        char c = (char)ch;
+        if (buf_insert(gInputBuf, &gInputLen, gCaretPos, &c, 1, GUI_INPUT_LEN))
+            gCaretPos += 1;
     }
     gui_repaint_input();
 }
