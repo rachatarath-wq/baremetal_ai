@@ -1716,6 +1716,10 @@ static EFI_STATUS init_gop(void) {
 #define KBD_SCAN_END    0x06
 #define KBD_SCAN_DELETE 0x08
 
+/* EFI scan codes for paging through the chat log (เหมือนเปิดหน้าหนังสือ). */
+#define KBD_SCAN_PAGEUP   0x09
+#define KBD_SCAN_PAGEDOWN 0x0A
+
 /* ESC, used to cancel the model-picker drop-down. */
 #define KBD_SCAN_ESC   0x17
 
@@ -2347,7 +2351,7 @@ static void kb_remember(EFI_FILE_HANDLE root, char *arg) {
 #define GUI_PAD            24    /* inner padding for window contents, px      */
 #define GUI_POLL_US        10000 /* 10 ms idle yield between input polls       */
 #define GUI_INPUT_LEN      512   /* editable input buffer, bytes               */
-#define GUI_CHAT_MAX_LINES 48
+#define GUI_CHAT_MAX_LINES 200
 #define GUI_CHAT_LINE_LEN  300   /* bytes: room for 80 three-byte Thai chars   */
 #define GUI_STATUS_H       40    /* top status bar height, px                  */
 #define CARET_W            3     /* input caret (text cursor) width, px        */
@@ -2406,6 +2410,7 @@ static int     gEmotionHoldLoops = 0;   /* ticks left before reverting to idle  
 
 static char gChatLog[GUI_CHAT_MAX_LINES][GUI_CHAT_LINE_LEN];
 static int  gChatLines = 0;
+static int  gChatScroll = 0;   /* lines scrolled up from the newest (0 = bottom) */
 
 static EFI_FILE_HANDLE gRoot = NULL;   /* set by gui_run(); used by gui_send() */
 
@@ -2787,6 +2792,7 @@ static void gui_chat_append(const char *line) {
  * renderer (which would reset the cursor to screen column 0 and spill text
  * outside the chat frame). */
 static void gui_chat_add(const char *text) {
+    gChatScroll = 0;   /* new content -> snap the view back to the newest line */
     int max_cells = ((int)gChatBox.w - 2 * GUI_PAD) / HRFONT_W;
     if (max_cells < 1) max_cells = 1;
 
@@ -2999,15 +3005,47 @@ static void gui_draw_input(void) {
     }
 }
 
+/* Number of chat lines that fit in the chat box (a "page"). */
+static int gui_chat_visible_lines(void) {
+    int vis = ((int)gChatBox.h - 2 * GUI_PAD) / HRFONT_H;
+    return vis < 1 ? 1 : vis;
+}
+
+/* Keep gChatScroll in range so the view never scrolls past the top line. */
+static void gui_chat_scroll_clamp(void) {
+    int vis = gui_chat_visible_lines();
+    int max_scroll = gChatLines - vis;
+    if (max_scroll < 0) max_scroll = 0;
+    if (gChatScroll < 0) gChatScroll = 0;
+    if (gChatScroll > max_scroll) gChatScroll = max_scroll;
+}
+
 static void gui_draw_chat(void) {
     draw_filled_rect(gChatBox.x, gChatBox.y, gChatBox.w, gChatBox.h, gColChatBg);
     int lx = gChatBox.x + GUI_PAD;
     int ly = gChatBox.y + GUI_PAD;
-    for (int i = 0; i < gChatLines; i++) {
-        int y = ly + i * HRFONT_H;
-        if (y + HRFONT_H > gChatBox.y + gChatBox.h) break;   /* off the bottom */
+
+    gui_chat_scroll_clamp();
+    int vis = gui_chat_visible_lines();
+    int end = gChatLines - gChatScroll;          /* one past the newest line shown */
+    if (end < 0) end = 0;
+    int start = end - vis;
+    if (start < 0) start = 0;
+
+    for (int i = start; i < end; i++) {
+        int y = ly + (i - start) * HRFONT_H;
         gui_text(lx, y, gChatLog[i], gColText, gColChatBg);
     }
+
+    /* Scroll affordance: show ^ when older lines are hidden above, v when newer
+     * lines are hidden below (ASCII — the font has no arrow glyphs). */
+    if (start > 0)
+        gui_text(gChatBox.x + gChatBox.w - GUI_PAD - 2 * HRFONT_W,
+                 gChatBox.y + 2, "^", gColAccent, gColChatBg);
+    if (end < gChatLines)
+        gui_text(gChatBox.x + gChatBox.w - GUI_PAD - 2 * HRFONT_W,
+                 gChatBox.y + gChatBox.h - HRFONT_H - 2, "v", gColAccent, gColChatBg);
+
     draw_rect(gChatBox.x, gChatBox.y, gChatBox.w, gChatBox.h, gColBorder);
 }
 
@@ -4918,6 +4956,7 @@ static void gui_chat_show_usage(void) {
     gui_chat_add("คู่มือวิธีใช้:");
     gui_chat_add("> F1 สลับพิมพ์ภาษาไทย / อังกฤษ");
     gui_chat_add("> ← → เลื่อนเคอร์เซอร์  Backspace/Delete ลบตัวอักษร");
+    gui_chat_add("> PageUp / PageDown เปิดหน้าข้อความก่อนหน้า / ถัดไป");
     gui_chat_add("> พิมพ์คำถาม แล้วกด Enter เพื่อถาม AI");
     gui_chat_add("> จำไว้: คำถาม = คำตอบ  เพื่อสอนความรู้ใหม่");
     gui_chat_add("> /games pacman  เล่นเกมแพคแมน");
@@ -5038,6 +5077,20 @@ static void gui_handle_key(EFI_INPUT_KEY key) {
     if (key.ScanCode == KBD_SCAN_END) {
         gCaretPos = gInputLen;
         gui_repaint_input();
+        return;
+    }
+
+    /* PgUp / PgDn: page through the chat log (ดูหน้าก่อนหน้า / หน้าถัดไป). */
+    if (key.ScanCode == KBD_SCAN_PAGEUP) {
+        gChatScroll += gui_chat_visible_lines();
+        gui_chat_scroll_clamp();
+        gui_repaint_chat();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_PAGEDOWN) {
+        gChatScroll -= gui_chat_visible_lines();
+        if (gChatScroll < 0) gChatScroll = 0;
+        gui_repaint_chat();
         return;
     }
 
