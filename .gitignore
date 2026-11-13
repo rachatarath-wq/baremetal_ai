@@ -40,3 +40,12 @@ __pycache__/
 /stories15M_thai_q80.bin
 /tinyllama_q80.bin
 /*_q80.bin
+
+# Songbook: the flat songs/ folder is the source of truth. The legacy single-file
+# songs.txt and any real copyrighted lyrics stay local-only (this repo is public).
+/songs.txt
+/songs/0004.txt
+
+# Release artifacts (per-release notes/image; not source)
+/RELEASE_NOTES.md
+/BOOTAI-v1.0.0.img

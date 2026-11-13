@@ -70,6 +70,10 @@ $(BUILD):
 
 install: $(TARGET)
 	cp $(TARGET) fat_usb/EFI/BOOT/BOOTX64.EFI
+	rm -rf fat_usb/songs
+	cp -R songs fat_usb/songs
+	mkdir -p fat_usb/import
+	@rm -f fat_usb/songs.txt
 
 # Interactive: open a window and type straight into the guest (F1 toggles EN/TH).
 qemu: install

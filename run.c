@@ -2443,6 +2443,15 @@ static void gui_open_game_picker(void);
 static void gui_game_key(EFI_INPUT_KEY key);
 static void gui_game_tick(void);
 static int  gui_game_tick_us(void);
+static void gui_open_song_picker(void);
+static void gui_open_import_picker(void);
+static void import_run(int sel);
+static void song_view_open(int idx);
+static void song_view_key(EFI_INPUT_KEY key);
+static void song_editor_open(int idx);
+static void song_editor_key(EFI_INPUT_KEY key);
+static void song_delete_confirm_show(int idx);
+static void song_delete_key(EFI_INPUT_KEY key);
 
 /* screensaver state (chat desktop) */
 static UINT64 gIdleUs = 0;         /* microseconds since the last input         */
@@ -2462,17 +2471,67 @@ static float       gTemperature    = 1.0f;
 static float       gTopp           = 0.9f;
 static unsigned long long gSeed    = 1337;
 
-/* --- model picker: drop-down list of *.bin models for /loadmodel ---------- */
+/* --- picker: generic drop-down list (models / games / songs) --------------- */
 #define MODEL_PICKER_MAX 16
+#define PICKER_MAX_ITEMS 1000
 static int  gPickerOn    = 0;      /* 1 = the picker overlay is showing        */
-static char gPickerNames[MODEL_PICKER_MAX][64];
+static char gPickerNames[PICKER_MAX_ITEMS][64];
 static int  gPickerCount = 0;
 static int  gPickerSel   = 0;      /* highlighted row index                    */
+static int  gPickerTop   = 0;      /* first visible row (scrolling long lists) */
 
-#define PICKER_MODEL 0
-#define PICKER_GAME  1
+#define PICKER_MODEL  0
+#define PICKER_GAME   1
+#define PICKER_SONG   2
+#define PICKER_IMPORT 3
 static int        gPickerKind  = PICKER_MODEL;
 static const char *gPickerTitle = "เลือกโมเดล (Enter=เลือก, Esc=ยกเลิก)";
+
+/* --- songbook: เนื้อ + คอร์ด -------------------------------------------------
+ * One song = one file under songs/ (e.g. songs/0001.txt).  gSongs[] holds only
+ * title/artist/album + the file path (~370 B each), so a 1000-song library is a
+ * few hundred KB.  The lyrics of the one song being viewed/edited are loaded on
+ * demand into gCurSong. */
+#define SONGS_MAX      1000
+#define SONG_TITLE_LEN 80
+#define SONG_ARTIST_LEN 80
+#define SONG_ALBUM_LEN 80
+#define SONG_FNAME_LEN 80
+#define SONG_MAX_LINES 120
+#define SONG_LINE_LEN  160
+
+/* lightweight index entry: metadata + file path only */
+typedef struct {
+    char    title[SONG_TITLE_LEN];
+    char    artist[SONG_ARTIST_LEN];
+    char    album[SONG_ALBUM_LEN];
+    CHAR16  fname[SONG_FNAME_LEN];       /* path relative to gRoot, e.g. L"songs\\0001.txt" */
+} SongMeta;
+
+/* fully-loaded song: metadata + body lines (the one currently open) */
+typedef struct {
+    char   title[SONG_TITLE_LEN];
+    char   artist[SONG_ARTIST_LEN];
+    char   album[SONG_ALBUM_LEN];
+    int    nlines;
+    UINT8  kind[SONG_MAX_LINES];          /* 0 = lyric, 1 = chord line */
+    char   line[SONG_MAX_LINES][SONG_LINE_LEN];
+} Song;
+
+static SongMeta *gSongs = NULL;    /* AllocateZeroPool(SONGS_MAX * sizeof(SongMeta)) */
+static int       gSongCount = 0;
+static Song      gCurSong;         /* full song open in the viewer/editor */
+
+/* legacy single-file mode: whole songs.txt held in memory (used only when the
+ * songs/ dir is absent); gCurSong bodies are extracted from it on demand. */
+static VOID  *gLegacyData = NULL;
+static UINTN  gLegacySize = 0;
+
+/* song viewer state (full-screen chords + lyrics) */
+static int gSongViewOn  = 0;
+static int gSongViewIdx = 0;
+static int gSongLine    = 0;      /* current line = the position marker        */
+static int gSongTop     = 0;      /* first visible line of the body            */
 
 /* ----------------------------------------------------------------------------
  * 1. Mouse protocol: prefer EFI_SIMPLE_POINTER_PROTOCOL (relative mouse), fall
@@ -3298,11 +3357,94 @@ static void load_new_model(const char *filename) {
  *      highlight, Enter loads the selected checkpoint, Esc cancels.
  * ------------------------------------------------------------------------- */
 
+/* --- song search + import state ------------------------------------------- */
+static int    gPickerIdx[PICKER_MAX_ITEMS];   /* filtered row -> gSongs[] index */
+static char   gPickerSearch[64];              /* UTF-8 search query */
+static int    gPickerSearchLen = 0;
+static CHAR16 gImportPaths[PICKER_MAX_ITEMS][SONG_FNAME_LEN];
+static int    gImportCount = 0;
+
+/* case-insensitive ASCII substring match (Thai bytes match exactly) */
+static int str_find_nocase(const char *hay, const char *needle) {
+    if (needle[0] == '\0') return 1;          /* empty query matches all */
+    int nl = (int)strlen(needle);
+    int hl = (int)strlen(hay);
+    for (int i = 0; i + nl <= hl; i++) {
+        int ok = 1;
+        for (int j = 0; j < nl; j++) {
+            unsigned char a = (unsigned char)hay[i + j];
+            unsigned char b = (unsigned char)needle[j];
+            if (a != b) {
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+                if (a != b) { ok = 0; break; }
+            }
+        }
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+/* Rebuild the picker rows from gSongs[] filtered by gPickerSearch (matches
+ * title OR artist).  Fills gPickerIdx[] + gPickerNames[] + gPickerCount. */
+static void song_picker_filter(void) {
+    gPickerCount = 0;
+    for (int i = 0; i < gSongCount && gPickerCount < PICKER_MAX_ITEMS; i++) {
+        if (!str_find_nocase(gSongs[i].title, gPickerSearch) &&
+            !str_find_nocase(gSongs[i].artist, gPickerSearch))
+            continue;
+        gPickerIdx[gPickerCount] = i;
+        int n = 0;
+        for (const char *p = gSongs[i].title; *p && n < 63; p++)
+            gPickerNames[gPickerCount][n++] = *p;
+        gPickerNames[gPickerCount][n] = '\0';
+        gPickerCount++;
+    }
+    gPickerSel = 0;
+    gPickerTop = 0;
+}
+
+static void song_picker_search_add(CHAR16 ch) {
+    if (ch < 0x20 || ch >= 0x7f) return;
+    UINT32 cp = (UINT32)ch;
+    if (gThaiMode) {
+        UINT32 th = gKedmanee[(unsigned char)ch];
+        if (th) cp = th;
+    }
+    char enc[4];
+    int n = cp_to_utf8(cp, enc);
+    if (gPickerSearchLen + n >= (int)sizeof(gPickerSearch) - 1) return;
+    for (int i = 0; i < n; i++) gPickerSearch[gPickerSearchLen++] = enc[i];
+    gPickerSearch[gPickerSearchLen] = '\0';
+    song_picker_filter();
+}
+
+static void song_picker_search_backspace(void) {
+    if (gPickerSearchLen == 0) return;
+    int start = grapheme_prev(gPickerSearch, gPickerSearchLen);
+    gPickerSearch[start] = '\0';
+    gPickerSearchLen = start;
+    song_picker_filter();
+}
+
+/* UTF-16 -> UTF-8 (BMP only; filenames here are Thai/ASCII). */
+static int wchar16_to_utf8(const CHAR16 *w, char *out, int max) {
+    int n = 0;
+    while (*w && n < max - 4) {
+        char enc[4];
+        int k = cp_to_utf8((UINT32)*w++, enc);
+        for (int i = 0; i < k && n < max - 1; i++) out[n++] = enc[i];
+    }
+    out[n] = '\0';
+    return n;
+}
+
 static void gui_draw_picker(void) {
     int W = (int)gFbWidth, H = (int)gFbHeight;
     int row_h   = HRFONT_H;
     int pad     = 12;                    /* vertical padding inside the box    */
     int title_h = HRFONT_H + 2 * pad;   /* header row (title text) height      */
+    int search_h = (gPickerKind == PICKER_SONG) ? HRFONT_H : 0;  /* search box */
 
     /* widest item name + selection marker, but at least the title width */
     int w = 0;
@@ -3312,10 +3454,14 @@ static void gui_draw_picker(void) {
     }
     int tw = gui_text_cells(gPickerTitle) * HRFONT_W + 2 * GUI_PAD;
     if (w < tw) w = tw;
+    if (gPickerKind == PICKER_SONG) {      /* keep the search prompt readable */
+        int sw = gui_text_cells("ค้นหา: ") * HRFONT_W + 16 * HRFONT_W + 2 * GUI_PAD;
+        if (w < sw) w = sw;
+    }
 
     int maxw = W - 2 * 48;
     if (w > maxw) w = maxw;
-    int h = title_h + gPickerCount * row_h + 2 * pad;
+    int h = title_h + search_h + gPickerCount * row_h + 2 * pad;
     if (h > H - 2 * 48) h = H - 2 * 48;
 
     int x = (W - w) / 2;
@@ -3326,9 +3472,34 @@ static void gui_draw_picker(void) {
 
     gui_text(x + GUI_PAD, y + pad, gPickerTitle, gColAccent, gColChatBg);
 
-    int list_y = y + title_h;
-    for (int i = 0; i < gPickerCount; i++) {
-        int row_y = list_y + i * row_h;
+    if (gPickerKind == PICKER_SONG) {
+        int sy = y + title_h;
+        char sbuf[72]; int sn = 0;
+        const char *sp = "ค้นหา: "; while (*sp && sn < 64) sbuf[sn++] = *sp++;
+        for (int i = 0; i < gPickerSearchLen && sn < 64; i++) sbuf[sn++] = gPickerSearch[i];
+        sbuf[sn] = '\0';
+        gui_text(x + GUI_PAD, sy, sbuf, gColText, gColChatBg);
+        int cw = gui_text_cells(sbuf) * HRFONT_W;
+        draw_filled_rect(x + GUI_PAD + cw, sy, CARET_W, HRFONT_H, gColText);
+        draw_filled_rect(x + 4, sy + HRFONT_H - 2, w - 8, 2, gColBorder);
+    }
+
+    /* number of rows that actually fit the box (long lists scroll) */
+    int list_h = h - title_h - search_h - 2 * pad;
+    int visible = list_h / row_h;
+    if (visible < 1) visible = 1;
+    if (visible > gPickerCount) visible = gPickerCount;
+
+    /* keep the highlighted row inside the visible window */
+    if (gPickerSel < gPickerTop) gPickerTop = gPickerSel;
+    if (gPickerSel >= gPickerTop + visible) gPickerTop = gPickerSel - visible + 1;
+    if (gPickerTop < 0) gPickerTop = 0;
+    if (gPickerTop + visible > gPickerCount) gPickerTop = gPickerCount - visible;
+    if (gPickerTop < 0) gPickerTop = 0;
+
+    int list_y = y + title_h + search_h;
+    for (int i = gPickerTop; i < gPickerTop + visible; i++) {
+        int row_y = list_y + (i - gPickerTop) * row_h;
         int sel   = (i == gPickerSel);
         if (sel) draw_filled_rect(x + 4, row_y, w - 8, row_h, gColAccent);
         char row[96];
@@ -3351,6 +3522,7 @@ static void gui_open_model_picker(void) {
     gPickerKind  = PICKER_MODEL;
     gPickerTitle = "เลือกโมเดล (Enter=เลือก, Esc=ยกเลิก)";
     gPickerSel = 0;
+    gPickerTop = 0;
     gPickerOn  = 1;
     if (mouse_available()) mouse_restore();   /* don't leave a stale cursor     */
     gui_draw_picker();
@@ -3368,19 +3540,71 @@ static void gui_picker_key(EFI_INPUT_KEY key) {
         return;
     }
     if (key.ScanCode == KBD_SCAN_ESC) {
+        if (gPickerKind == PICKER_SONG && gPickerSearchLen > 0) {
+            gPickerSearch[0] = '\0'; gPickerSearchLen = 0;   /* clear search first */
+            song_picker_filter();
+            gui_draw_picker();
+            return;
+        }
         gPickerOn = 0;
-        gui_chat_add("> cancelled");
-        gui_repaint_chat();
+        if (gPickerKind == PICKER_IMPORT) {
+            gui_open_song_picker();      /* back to the song list */
+        } else {
+            gui_chat_add("> cancelled");
+            gui_repaint_chat();
+        }
         return;
     }
     if (key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
+        if (gPickerCount == 0) return;   /* nothing selected (e.g. no search hits) */
         gPickerOn = 0;
         if (gPickerKind == PICKER_GAME) {
             gui_start_game(gPickerSel);   /* paints the game board; keep it */
+        } else if (gPickerKind == PICKER_SONG) {
+            song_view_open(gPickerIdx[gPickerSel]);   /* filtered row -> real index */
+        } else if (gPickerKind == PICKER_IMPORT) {
+            import_run(gPickerSel);
         } else {
             load_new_model(gPickerNames[gPickerSel]);
             gui_repaint_chat();
         }
+        return;
+    }
+    if (gPickerKind == PICKER_SONG) {
+        if (key.ScanCode == KBD_SCAN_F1) { gThaiMode = !gThaiMode; gui_draw_picker(); return; }
+        CHAR16 ch = key.UnicodeChar;
+        if (ch == CHAR_BACKSPACE) { song_picker_search_backspace(); gui_draw_picker(); return; }
+        if (key.ScanCode == KBD_SCAN_DELETE) {  /* ลบเพลงที่เลือก (ถามยืนยัน) */
+            if (gPickerCount == 0) return;
+            gPickerOn = 0;
+            song_delete_confirm_show(gPickerIdx[gPickerSel]);
+            return;
+        }
+        /* N/E/I are commands only while the search box is empty; once typing a
+         * query, every printable char (incl. n/e/i) filters the list. */
+        if (gPickerSearchLen == 0) {
+            if (ch == 'n' || ch == 'N') {           /* เพิ่มเพลงใหม่ */
+                gPickerOn = 0;
+                song_editor_open(-1);
+                return;
+            }
+            if (ch == 'e' || ch == 'E') {           /* แก้เพลงที่เลือก */
+                if (gPickerCount == 0) return;
+                gPickerOn = 0;
+                song_editor_open(gPickerIdx[gPickerSel]);
+                return;
+            }
+            if (ch == 'i' || ch == 'I') {           /* นำเข้าเพลงจาก import/ */
+                gPickerOn = 0;
+                gui_open_import_picker();
+                return;
+            }
+        }
+        /* any other printable key filters the list (search) */
+        if (key.ScanCode != 0) return;
+        if (ch < 0x20 || ch >= 0x7f) return;
+        song_picker_search_add(ch);
+        gui_draw_picker();
         return;
     }
     /* any other key is ignored while the picker is showing */
@@ -4858,9 +5082,1130 @@ static void gui_open_game_picker(void) {
         gPickerNames[i][n] = '\0';
     }
     gPickerSel = 0;
+    gPickerTop = 0;
     gPickerOn  = 1;
     if (mouse_available()) mouse_restore();
     gui_draw_picker();
+}
+
+/* ----------------------------------------------------------------------------
+ * Songbook (/songs): load songs.txt, pick a song, then page through its
+ * chords + lyrics with a position marker (highlight + "บรรทัด N/M" + progress
+ * bar) and per-song resume (saved to songmarks.txt on the boot volume).
+ * ------------------------------------------------------------------------- */
+
+/* Append one UTF-8 line to `path` on the boot volume (same as kb.txt's writer). */
+static int file_append(EFI_FILE_HANDLE root, CHAR16 *path, const char *line) {
+    EFI_STATUS status;
+    EFI_FILE_HANDLE file = NULL;
+    EFI_FILE_INFO *info = NULL;
+    UINTN info_size = SIZE_OF_EFI_FILE_INFO + 256;
+    EFI_GUID fiGuid = EFI_FILE_INFO_ID;
+    UINT64 mode = EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE;
+
+    status = uefi_call_wrapper(root->Open, 5, root, &file, path, mode, 0);
+    if (EFI_ERROR(status)) return -1;
+
+    info = AllocateZeroPool(info_size);
+    if (info != NULL) {
+        status = uefi_call_wrapper(file->GetInfo, 4, file, &fiGuid, &info_size, info);
+        if (!EFI_ERROR(status))
+            uefi_call_wrapper(file->SetPosition, 2, file, (UINT64)info->FileSize);
+        FreePool(info);
+    }
+
+    UINTN want = strlen(line);
+    UINTN len = want;
+    status = uefi_call_wrapper(file->Write, 3, file, &len, (VOID *)line);
+    int ok = (!EFI_ERROR(status) && len == want);
+    uefi_call_wrapper(file->Flush, 1, file);
+    uefi_call_wrapper(file->Close, 1, file);
+    return ok ? 0 : -1;
+}
+
+static int song_atoi(const char *s) {
+    int v = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+    return v;
+}
+
+/* Copy up to `max-1` bytes and NUL-terminate (UTF-8 safe: may cut a codepoint,
+ * but a truncated trailing char is harmless for display). */
+static void song_copy(char *dst, const char *src, int len, int max) {
+    int n = (len < max - 1) ? len : (max - 1);
+    if (n < 0) n = 0;
+    memcpy(dst, src, (UINTN)n);
+    dst[n] = '\0';
+}
+
+/* --- per-song file helpers (songs/ = one .txt per song) ------------------- */
+
+static void wcopy(CHAR16 *dst, const CHAR16 *src) {
+    while (*src) *dst++ = *src++;
+    *dst = 0;
+}
+static void wconcat(CHAR16 *dst, const CHAR16 *src) {
+    while (*dst) dst++;
+    while (*src) *dst++ = *src++;
+    *dst = 0;
+}
+static int wcmp(const CHAR16 *a, const CHAR16 *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)*a - (int)*b;
+}
+
+/* List *.txt basenames under `dirpath` (sorted).  0 + *count on success. */
+static int dir_list_txt(EFI_FILE_HANDLE root, CHAR16 *dirpath,
+                        CHAR16 names[][SONG_FNAME_LEN], int max, int *count) {
+    EFI_FILE_HANDLE dir = NULL;
+    EFI_STATUS status = uefi_call_wrapper(root->Open, 5, root, &dir, dirpath,
+                                          EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(status) || dir == NULL) return -1;
+
+    EFI_FILE_INFO *info = (EFI_FILE_INFO *)AllocateZeroPool(SIZE_OF_EFI_FILE_INFO + 1024);
+    if (info == NULL) { uefi_call_wrapper(dir->Close, 1, dir); return -1; }
+    int n = 0;
+
+    while (n < max) {
+        UINTN sz = SIZE_OF_EFI_FILE_INFO + 1024;
+        status = uefi_call_wrapper(dir->Read, 3, dir, &sz, info);
+        if (EFI_ERROR(status) || sz == 0) break;
+        if (info->Attribute & EFI_FILE_DIRECTORY) continue;
+        CHAR16 *nm = info->FileName;
+        if (nm[0] == '.') continue;
+        int len = 0; while (nm[len]) len++;
+        if (len < 4 || nm[len - 4] != '.') continue;
+        CHAR16 a = nm[len - 3], b = nm[len - 2], c = nm[len - 1];
+        if ((a != 't' && a != 'T') || (b != 'x' && b != 'X') || (c != 't' && c != 'T')) continue;
+        wcopy(names[n], nm);
+        n++;
+    }
+    FreePool(info);
+    uefi_call_wrapper(dir->Close, 1, dir);
+
+    for (int i = 1; i < n; i++) {                 /* insertion sort by name */
+        CHAR16 tmp[SONG_FNAME_LEN];
+        wcopy(tmp, names[i]);
+        int j = i - 1;
+        while (j >= 0 && wcmp(names[j], tmp) > 0) { wcopy(names[j + 1], names[j]); j--; }
+        wcopy(names[j + 1], tmp);
+    }
+    *count = n;
+    return 0;
+}
+
+/* gnu-efi's EFI_FILE_DELETE typedef is broken (1 arg); the real firmware API is
+ * Delete(This, FileName).  Cast and call the real 2-arg version. */
+typedef EFI_STATUS (EFIAPI *EFI_FILE_DELETE2)(EFI_FILE_HANDLE File, CHAR16 *FileName);
+
+static int file_delete(EFI_FILE_HANDLE root, CHAR16 *fullpath) {
+    EFI_FILE_HANDLE file = NULL;
+    EFI_STATUS status = uefi_call_wrapper(root->Open, 5, root, &file, fullpath,
+                                          EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+    if (EFI_ERROR(status) || file == NULL) return -1;
+    CHAR16 *base = fullpath;
+    for (CHAR16 *p = fullpath; *p; p++) if (*p == '\\') base = p + 1;
+    EFI_FILE_DELETE2 del = (EFI_FILE_DELETE2)(VOID *)file->Delete;
+    status = uefi_call_wrapper(del, 2, file, base);   /* Delete closes the handle */
+    return EFI_ERROR(status) ? -1 : 0;
+}
+
+/* Parse one song's text (a single file) into `out`.  Returns 0 if a @title was
+ * found, else -1.  Stops at @end; trailing lines are ignored. */
+static int song_parse(const char *data, UINTN size, Song *out) {
+    out->nlines = 0;
+    out->title[0] = out->artist[0] = out->album[0] = '\0';
+    const char *p = data, *end = data + size;
+    int have = 0;
+    while (p < end) {
+        const char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        UINTN len = (UINTN)(nl - p);
+        if (len > 0 && p[len - 1] == '\r') len--;
+        const char *nxt = (nl < end) ? nl + 1 : end;
+        if (len == 0 || p[0] == '#') { p = nxt; continue; }
+        if (p[0] == '@') {
+            char tag[16]; int ti = 0;
+            const char *q = p + 1;
+            while (q < p + len && *q != ' ' && *q != '\t' && ti < 15) tag[ti++] = *q++;
+            tag[ti] = '\0';
+            while (q < p + len && (*q == ' ' || *q == '\t')) q++;
+            const char *val = q;
+            int vlen = (int)(p + len - val);
+            if (strcmp(tag, "title") == 0) { song_copy(out->title, val, vlen, SONG_TITLE_LEN); have = 1; }
+            else if (strcmp(tag, "artist") == 0) song_copy(out->artist, val, vlen, SONG_ARTIST_LEN);
+            else if (strcmp(tag, "album") == 0) song_copy(out->album, val, vlen, SONG_ALBUM_LEN);
+            else if (strcmp(tag, "end") == 0) break;
+            p = nxt; continue;
+        }
+        if (!have) { p = nxt; continue; }
+        if (out->nlines < SONG_MAX_LINES) {
+            int k = out->nlines++;
+            if (p[0] == '>') { out->kind[k] = 1; song_copy(out->line[k], p + 1, (int)(len - 1), SONG_LINE_LEN); }
+            else { out->kind[k] = 0; song_copy(out->line[k], p, (int)len, SONG_LINE_LEN); }
+        }
+        p = nxt;
+    }
+    return have ? 0 : -1;
+}
+
+/* Build "songs\\NNNN.txt" (zero-padded to 4 digits) into `dst`. */
+static void song_make_fname(CHAR16 *dst, int n) {
+    int i = 0;
+    static const CHAR16 pre[] = L"songs\\";
+    for (int k = 0; pre[k]; k++) dst[i++] = pre[k];
+    CHAR16 num[8]; int d = 0;
+    int t = n;
+    do { num[d++] = (CHAR16)('0' + (t % 10)); t /= 10; } while (t > 0);
+    while (d < 4) num[d++] = '0';
+    while (d > 0) dst[i++] = num[--d];
+    static const CHAR16 suf[] = L".txt";
+    for (int k = 0; suf[k]; k++) dst[i++] = suf[k];
+    dst[i] = 0;
+}
+
+/* Next free numeric id = max existing id + 1. */
+static int song_next_number(void) {
+    int maxn = 0;
+    for (int i = 0; i < gSongCount; i++) {
+        CHAR16 *p = gSongs[i].fname;
+        while (*p && !(*p >= '0' && *p <= '9')) p++;
+        int n = 0;
+        while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
+        if (n > maxn) maxn = n;
+    }
+    return maxn + 1;
+}
+
+/* Load the full lyrics of song `idx` into gCurSong. */
+static int legacy_song_parse(int idx, Song *out);   /* defined below songs_load */
+static void song_body_load(int idx) {
+    if (gLegacyData != NULL) {
+        if (legacy_song_parse(idx, &gCurSong) != 0) {
+            gCurSong.nlines = 0;
+            gCurSong.title[0] = gCurSong.artist[0] = gCurSong.album[0] = '\0';
+        }
+        return;
+    }
+    VOID *data = NULL; UINTN size = 0;
+    if (EFI_ERROR(read_file(gRoot, gSongs[idx].fname, 0, &data, &size)) || data == NULL) {
+        gCurSong.nlines = 0;
+        gCurSong.title[0] = gCurSong.artist[0] = gCurSong.album[0] = '\0';
+        return;
+    }
+    song_parse((char *)data, size, &gCurSong);
+    FreePool(data);
+}
+
+/* Load the song index: scan the songs/ dir (one .txt per song), fall back to
+ * a legacy songs.txt in the root. */
+static int songs_load(EFI_FILE_HANDLE root) {
+    gSongs = AllocateZeroPool(SONGS_MAX * sizeof(SongMeta));
+    if (gSongs == NULL) return -1;
+    gSongCount = 0;
+
+    CHAR16 names[PICKER_MAX_ITEMS][SONG_FNAME_LEN];
+    int n = 0;
+    if (dir_list_txt(root, L"songs\\", names, PICKER_MAX_ITEMS, &n) == 0 && n > 0) {
+        for (int i = 0; i < n && gSongCount < SONGS_MAX; i++) {
+            CHAR16 full[SONG_FNAME_LEN];
+            wcopy(full, L"songs\\");
+            wconcat(full, names[i]);
+            VOID *data = NULL; UINTN size = 0;
+            if (EFI_ERROR(read_file(root, full, 0, &data, &size)) || data == NULL) continue;
+            Song tmp;
+            if (song_parse((char *)data, size, &tmp) == 0 && tmp.title[0]) {
+                wcopy(gSongs[gSongCount].fname, full);
+                song_copy(gSongs[gSongCount].title, tmp.title, (int)strlen(tmp.title), SONG_TITLE_LEN);
+                song_copy(gSongs[gSongCount].artist, tmp.artist, (int)strlen(tmp.artist), SONG_ARTIST_LEN);
+                song_copy(gSongs[gSongCount].album, tmp.album, (int)strlen(tmp.album), SONG_ALBUM_LEN);
+                gSongCount++;
+            }
+            FreePool(data);
+        }
+        return gSongCount;
+    }
+
+    /* legacy fallback: one songs.txt in the boot root holding multiple songs */
+    VOID *data = NULL; UINTN size = 0;
+    if (EFI_ERROR(read_file(root, L"\\songs.txt", 0, &data, &size)) || data == NULL)
+        return gSongCount;
+
+    char *p = (char *)data, *end = p + size;
+    int have = 0;
+    while (p < end && gSongCount < SONGS_MAX) {
+        char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        UINTN len = (UINTN)(nl - p);
+        if (len > 0 && p[len - 1] == '\r') len--;
+        char *nxt = (nl < end) ? nl + 1 : end;
+        if (len == 0 || p[0] == '#') { p = nxt; continue; }
+        if (p[0] == '@') {
+            char tag[16]; int ti = 0;
+            char *q = p + 1;
+            while (q < p + len && *q != ' ' && *q != '\t' && ti < 15) tag[ti++] = *q++;
+            tag[ti] = '\0';
+            while (q < p + len && (*q == ' ' || *q == '\t')) q++;
+            char *val = q;
+            int vlen = (int)(p + len - val);
+            if (strcmp(tag, "title") == 0) {
+                if (have) gSongCount++;
+                if (gSongCount < SONGS_MAX) {
+                    song_make_fname(gSongs[gSongCount].fname, gSongCount + 1);
+                    song_copy(gSongs[gSongCount].title, val, vlen, SONG_TITLE_LEN);
+                }
+                have = 1;
+            } else if (strcmp(tag, "artist") == 0 && have && gSongCount < SONGS_MAX) {
+                song_copy(gSongs[gSongCount].artist, val, vlen, SONG_ARTIST_LEN);
+            } else if (strcmp(tag, "album") == 0 && have && gSongCount < SONGS_MAX) {
+                song_copy(gSongs[gSongCount].album, val, vlen, SONG_ALBUM_LEN);
+            } else if (strcmp(tag, "end") == 0) {
+                if (have) gSongCount++;
+                have = 0;
+            }
+            p = nxt; continue;
+        }
+        p = nxt;   /* body lines: ignored for the index */
+    }
+    if (have) gSongCount++;
+    gLegacyData = data;          /* keep it; bodies are parsed on demand */
+    gLegacySize = size;
+    return gSongCount;
+}
+
+/* Extract the `idx`-th song (0-based) from the legacy songs.txt in memory. */
+static int legacy_song_parse(int idx, Song *out) {
+    char *p = (char *)gLegacyData, *end = p + gLegacySize;
+    int cur = -1;
+    while (p < end) {
+        char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        UINTN len = (UINTN)(nl - p);
+        if (len > 0 && p[len - 1] == '\r') len--;
+        char *nxt = (nl < end) ? nl + 1 : end;
+        if (len > 0 && p[0] == '@') {
+            char tag[16]; int ti = 0;
+            char *q = p + 1;
+            while (q < p + len && *q != ' ' && *q != '\t' && ti < 15) tag[ti++] = *q++;
+            tag[ti] = '\0';
+            if (strcmp(tag, "title") == 0) {
+                cur++;
+                if (cur == idx) {
+                    /* parse this block; song_parse stops at the @end line */
+                    return song_parse(p, (UINTN)(end - p), out);
+                }
+            }
+        }
+        p = nxt;
+    }
+    return -1;
+}
+
+/* Last saved line for song `idx` (0 if never bookmarked). */
+static int song_bookmark_load(int idx) {
+    VOID *data = NULL;
+    UINTN size = 0;
+    EFI_STATUS st = read_file(gRoot, L"\\songmarks.txt", 0, &data, &size);
+    if (EFI_ERROR(st) || data == NULL) return 0;
+    if (size < 2) { FreePool(data); return 0; }
+
+    const char *title = gSongs[idx].title;
+    int found = 0;
+    char *p = (char *)data;
+    char *end = p + size;
+    while (p < end) {
+        char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        char *tab = p;
+        while (tab < nl && *tab != '\t') tab++;
+        if (tab < nl && *tab == '\t') {
+            *tab = '\0';
+            if (strcmp(p, title) == 0) found = song_atoi(tab + 1);
+            *tab = '\t';
+        }
+        p = (nl < end) ? nl + 1 : end;
+    }
+    FreePool(data);
+    return found;
+}
+
+/* Persist the current line for song `idx` (append; the last entry wins on load). */
+static void song_bookmark_save(int idx, int line) {
+    const char *title = gSongs[idx].title;
+    char lb[SONG_TITLE_LEN + 16];
+    int n = 0;
+    for (const char *p = title; *p && n < SONG_TITLE_LEN - 1; p++) lb[n++] = *p;
+    lb[n++] = '\t';
+    gui_itoa(line, lb + n); while (lb[n]) n++;
+    lb[n++] = '\n';
+    lb[n] = '\0';
+    file_append(gRoot, L"\\songmarks.txt", lb);
+}
+
+static void gui_open_song_picker(void) {
+    if (gSongCount == 0) {
+        gui_chat_add("> ไม่พบเพลง (โฟลเดอร์ songs/ หรือ songs.txt ใน root ของ USB)");
+        gui_repaint_chat();
+        return;
+    }
+    gPickerKind  = PICKER_SONG;
+    gPickerTitle = "เลือกเพลง (Enter เปิด, N เพิ่ม, E แก้, Del ลบ, I นำเข้า, Esc กลับ)";
+    gPickerSearch[0] = '\0';
+    gPickerSearchLen = 0;
+    song_picker_filter();      /* fills gPickerIdx/Names/Count (no query = all) */
+    gPickerOn  = 1;
+    if (mouse_available()) mouse_restore();
+    gui_draw_picker();
+}
+
+static int song_view_visible_lines(void) {
+    int H = (int)gFbHeight;
+    int m = 48, pad = 12;
+    int body_y = m + 2 * HRFONT_H + 16;
+    int footer_y = H - m - HRFONT_H;
+    int inner_h = (footer_y - 16 - body_y) - 2 * pad;
+    int visible = inner_h / HRFONT_H;
+    return visible < 1 ? 1 : visible;
+}
+
+/* Keep gSongTop such that the highlighted line (gSongLine) is on screen. */
+static void song_view_clamp_top(void) {
+    int nlines = gCurSong.nlines;
+    int vis = song_view_visible_lines();
+    if (gSongTop > gSongLine) gSongTop = gSongLine;
+    if (gSongTop + vis <= gSongLine) gSongTop = gSongLine - vis + 1;
+    if (gSongTop < 0) gSongTop = 0;
+    int maxtop = nlines - vis;
+    if (maxtop < 0) maxtop = 0;
+    if (gSongTop > maxtop) gSongTop = maxtop;
+}
+
+static void song_view_draw(void) {
+    Song *s = &gCurSong;
+    int W = (int)gFbWidth, H = (int)gFbHeight;
+    int m = 48, pad = 12;
+
+    fb_fill(0, 0, gFbWidth, gFbHeight, gColDesktop);
+
+    /* header: title (accent) + "artist - album" */
+    gui_text(m, m, s->title, gColAccent, gColDesktop);
+
+    char meta[160];
+    int mn = 0;
+    for (const char *p = s->artist; *p && mn < 80; p++) meta[mn++] = *p;
+    for (const char *p = " - "; *p && mn < 159; p++) meta[mn++] = *p;
+    for (const char *p = s->album; *p && mn < 159; p++) meta[mn++] = *p;
+    meta[mn] = '\0';
+    gui_text(m, m + HRFONT_H, meta, gColText, gColDesktop);
+
+    /* body: chords + lyrics */
+    int body_x = m;
+    int body_y = m + 2 * HRFONT_H + 16;
+    int footer_y = H - m - HRFONT_H;
+    int body_h = footer_y - 16 - body_y;
+    int body_w = W - 2 * m;
+    draw_filled_rect(body_x, body_y, body_w, body_h, gColChatBg);
+    draw_rect(body_x, body_y, body_w, body_h, gColBorder);
+
+    song_view_clamp_top();
+    int vis = song_view_visible_lines();
+    int lx = body_x + pad;
+    int ly = body_y + pad;
+    int nlines = s->nlines;
+
+    for (int i = 0; i < vis; i++) {
+        int li = gSongTop + i;
+        if (li >= nlines) break;
+        int y = ly + i * HRFONT_H;
+        int cur = (li == gSongLine);
+        if (cur) {
+            draw_filled_rect(body_x + 2, y, body_w - 4, HRFONT_H, gColAccent);
+            gui_text(lx, y, s->line[li], gColChatBg, gColAccent);
+        } else {
+            UINT32 fg = s->kind[li] ? gColAccent : gColText;
+            gui_text(lx, y, s->line[li], fg, gColChatBg);
+        }
+    }
+
+    /* footer: "บรรทัด N/M" + hint, and a progress bar just above */
+    char pos[64]; int pn = 0;
+    for (const char *p = "บรรทัด "; *p; p++) pos[pn++] = *p;
+    gui_itoa(gSongLine + 1, pos + pn); while (pos[pn]) pn++;
+    pos[pn++] = '/';
+    gui_itoa(nlines, pos + pn); while (pos[pn]) pn++;
+    pos[pn] = '\0';
+    gui_text(m, footer_y, pos, gColText, gColDesktop);
+
+    const char *hint = "E แก้  Del ลบ  Esc กลับ";
+    gui_text(W - m - gui_text_cells(hint) * HRFONT_W, footer_y, hint,
+             gColText, gColDesktop);
+
+    int bar_h = 6;
+    int bar_y = footer_y - 14;
+    int bar_w = W - 2 * m;
+    draw_filled_rect(m, bar_y, bar_w, bar_h, gColBorder);
+    int filled = 0;
+    if (nlines > 0)
+        filled = (int)((long long)(gSongLine + 1) * bar_w / nlines);
+    if (filled > bar_w) filled = bar_w;
+    if (filled > 0) draw_filled_rect(m, bar_y, filled, bar_h, gColAccent);
+}
+
+static void song_view_open(int idx) {
+    gSongViewIdx = idx;
+    song_body_load(idx);                          /* lazy-load the lyrics */
+    int nlines = gCurSong.nlines;
+    gSongLine = song_bookmark_load(idx);       /* resume where we left off */
+    if (gSongLine < 0 || gSongLine >= nlines) gSongLine = 0;
+    gSongTop = gSongLine;
+    gSongViewOn = 1;
+    if (mouse_available()) mouse_restore();
+    song_view_draw();
+}
+
+static void song_view_key(EFI_INPUT_KEY key) {
+    int nlines = gCurSong.nlines;
+    int vis = song_view_visible_lines();
+
+    if (key.ScanCode == KBD_SCAN_UP) {
+        if (gSongLine > 0) gSongLine--;
+        song_view_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DOWN) {
+        if (gSongLine < nlines - 1) gSongLine++;
+        song_view_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_PAGEUP) {
+        gSongLine -= vis;
+        if (gSongLine < 0) gSongLine = 0;
+        song_view_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_PAGEDOWN) {
+        gSongLine += vis;
+        if (gSongLine >= nlines) gSongLine = nlines - 1;
+        song_view_draw();
+        return;
+    }
+    if (key.UnicodeChar == 'e' || key.UnicodeChar == 'E') {   /* แก้เพลงนี้ */
+        gSongViewOn = 0;
+        song_editor_open(gSongViewIdx);
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DELETE) {                    /* ลบเพลงนี้ */
+        gSongViewOn = 0;
+        song_delete_confirm_show(gSongViewIdx);
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_ESC) {
+        song_bookmark_save(gSongViewIdx, gSongLine);
+        gSongViewOn = 0;
+        gui_repaint_chat();
+        return;
+    }
+}
+
+/* =============================================================================
+ * On-device song editor: add / edit / delete songs, saved back to songs.txt.
+ * The editor is a flat list of rows: 3 metadata rows (title/artist/album) then
+ * the body lines (chord = ">", lyric = " ").  Enter edits a row inline using
+ * the same UTF-8 grapheme primitives as the chat box; S saves the whole book.
+ * ========================================================================== */
+
+static int gSongEditOn     = 0;   /* 1 = editor overlay showing */
+static int gSongEditIdx    = -1;  /* song being edited, -1 = new song */
+static int gSongEditSel    = 0;   /* selected row */
+static int gSongEditTop    = 0;   /* first visible row */
+static int gSongEditInline = -1;  /* row being edited inline, -1 = list mode */
+
+static char  gEdTitle[SONG_TITLE_LEN];
+static char  gEdArtist[SONG_ARTIST_LEN];
+static char  gEdAlbum[SONG_ALBUM_LEN];
+static int   gEdNLines = 0;
+static UINT8 gEdKind[SONG_MAX_LINES];
+static char  gEdLine[SONG_MAX_LINES][SONG_LINE_LEN];
+
+static char  gEditBuf[SONG_LINE_LEN];   /* inline-edit scratch buffer */
+static int   gEditLen   = 0;
+static int   gEditCaret = 0;
+
+static int gDelConfirm = 0;             /* 1 = delete-confirm overlay showing */
+static int gDelSongIdx = 0;
+
+/* append `s` into the growing buffer, never overflowing `cap` */
+static void sb_put(char *buf, UINTN *len, UINTN cap, const char *s) {
+    while (*s && *len < cap) buf[(*len)++] = *s++;
+}
+
+/* Overwrite a whole file.  UEFI CREATE keeps position 0 on an existing file,
+ * so this writes the new content from the start, then scrubs any stale tail
+ * (the old file may have been longer) with blank lines and finally best-effort
+ * truncates via SetInfo.  The scrub matters: if a *deleted* song's leftover
+ * @title survives in the tail, the parser would resurrect it on the next boot. */
+static int file_write_all(EFI_FILE_HANDLE root, CHAR16 *path,
+                          const char *data, UINTN len) {
+    EFI_FILE_HANDLE file = NULL;
+    EFI_STATUS status;
+    UINT64 old_size = 0;
+
+    status = uefi_call_wrapper(root->Open, 5, root, &file, path,
+                               EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE |
+                               EFI_FILE_MODE_CREATE, 0);
+    if (EFI_ERROR(status) || file == NULL) return -1;
+
+    /* remember the current size so we can scrub the stale tail below */
+    {
+        EFI_FILE_INFO *gi = (EFI_FILE_INFO *)AllocateZeroPool(SIZE_OF_EFI_FILE_INFO + 256);
+        if (gi != NULL) {
+            EFI_GUID fiGuid = EFI_FILE_INFO_ID;
+            UINTN sz = SIZE_OF_EFI_FILE_INFO + 256;
+            if (!EFI_ERROR(uefi_call_wrapper(file->GetInfo, 4, file, &fiGuid, &sz, gi)))
+                old_size = gi->FileSize;
+            FreePool(gi);
+        }
+    }
+
+    uefi_call_wrapper(file->SetPosition, 2, file, 0);
+    UINTN off = 0;
+    while (off < len) {
+        UINTN chunk = len - off;
+        status = uefi_call_wrapper(file->Write, 3, file, &chunk, (VOID *)(data + off));
+        if (EFI_ERROR(status) || chunk == 0) {
+            uefi_call_wrapper(file->Close, 1, file);
+            return -1;
+        }
+        off += chunk;
+    }
+
+    /* new content shorter than the old file: overwrite the tail with blank
+     * lines (the parser skips them) so no stale @title/@end can resurface */
+    if (old_size > len) {
+        char blanks[64];
+        for (int i = 0; i < 64; i++) blanks[i] = '\n';
+        UINTN pad = (UINTN)(old_size - len);
+        while (pad > 0) {
+            UINTN chunk = pad < 64 ? pad : 64;
+            UINTN w = chunk;
+            status = uefi_call_wrapper(file->Write, 3, file, &w, (VOID *)blanks);
+            if (EFI_ERROR(status) || w == 0) break;
+            pad -= w;
+        }
+    }
+
+    /* best-effort truncate to the new length (works on most FAT drivers) */
+    EFI_FILE_INFO *info = (EFI_FILE_INFO *)AllocateZeroPool(SIZE_OF_EFI_FILE_INFO);
+    if (info != NULL) {
+        EFI_GUID fiGuid = EFI_FILE_INFO_ID;
+        info->Size = SIZE_OF_EFI_FILE_INFO;
+        info->FileSize = len;
+        uefi_call_wrapper(file->SetInfo, 4, file, &fiGuid,
+                          SIZE_OF_EFI_FILE_INFO, info);
+        FreePool(info);
+    }
+
+    uefi_call_wrapper(file->Flush, 1, file);
+    uefi_call_wrapper(file->Close, 1, file);
+    return 0;
+}
+
+/* Serialize one song into @title/@artist/@album/body/@end and write it to
+ * `path` (one file per song under songs/). */
+static int song_write_file(EFI_FILE_HANDLE root, CHAR16 *path, Song *s) {
+    UINTN cap = (UINTN)(SONG_MAX_LINES * SONG_LINE_LEN + 512);
+    char *buf = (char *)AllocatePool(cap);
+    if (buf == NULL) return -1;
+    UINTN len = 0;
+
+    sb_put(buf, &len, cap, "@title ");  sb_put(buf, &len, cap, s->title);  sb_put(buf, &len, cap, "\n");
+    sb_put(buf, &len, cap, "@artist "); sb_put(buf, &len, cap, s->artist); sb_put(buf, &len, cap, "\n");
+    sb_put(buf, &len, cap, "@album ");  sb_put(buf, &len, cap, s->album);  sb_put(buf, &len, cap, "\n");
+    for (int j = 0; j < s->nlines; j++) {
+        if (s->kind[j]) sb_put(buf, &len, cap, ">");
+        sb_put(buf, &len, cap, s->line[j]);
+        sb_put(buf, &len, cap, "\n");
+    }
+    sb_put(buf, &len, cap, "@end\n");
+
+    int ok = file_write_all(root, path, buf, len);
+    FreePool(buf);
+    return ok;
+}
+
+/* Import: copy external text files (one .txt per song under import/, same @tag
+ * format) into songs/NNNN.txt as individual songs. */
+
+/* Commit one parsed song to the index + a new songs/NNNN.txt file. */
+static void import_commit_song(Song *s, int *imported) {
+    if (s->title[0] == '\0' || gSongCount >= SONGS_MAX) return;
+    song_make_fname(gSongs[gSongCount].fname, song_next_number());
+    song_copy(gSongs[gSongCount].title,  s->title,  (int)strlen(s->title),  SONG_TITLE_LEN);
+    song_copy(gSongs[gSongCount].artist, s->artist, (int)strlen(s->artist), SONG_ARTIST_LEN);
+    song_copy(gSongs[gSongCount].album,  s->album,  (int)strlen(s->album),  SONG_ALBUM_LEN);
+    song_write_file(gRoot, gSongs[gSongCount].fname, s);
+    gSongCount++;
+    (*imported)++;
+}
+
+/* Import the selected import/ .txt file.  A file may hold one or more
+ * @title...@end blocks; each becomes its own song. */
+static void import_run(int sel) {
+    if (sel < 0 || sel >= gImportCount) { gui_open_song_picker(); return; }
+    CHAR16 src[SONG_FNAME_LEN];
+    wcopy(src, L"import\\");
+    wconcat(src, gImportPaths[sel]);
+
+    VOID *data = NULL; UINTN size = 0;
+    if (EFI_ERROR(read_file(gRoot, src, 0, &data, &size)) || data == NULL) {
+        gui_chat_add("> อ่านไฟล์ import ไม่สำเร็จ");
+        gui_open_song_picker();
+        return;
+    }
+
+    char *p = (char *)data, *end = p + size;
+    int imported = 0;
+    Song cur;
+    cur.nlines = 0; cur.title[0] = cur.artist[0] = cur.album[0] = '\0';
+    int in_song = 0;
+
+    while (p < end && gSongCount < SONGS_MAX) {
+        char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        UINTN len = (UINTN)(nl - p);
+        if (len > 0 && p[len - 1] == '\r') len--;
+        char *nxt = (nl < end) ? nl + 1 : end;
+
+        if (len == 0 || p[0] == '#') { p = nxt; continue; }
+
+        if (p[0] == '@') {
+            char tag[16]; int ti = 0;
+            char *q = p + 1;
+            while (q < p + len && *q != ' ' && *q != '\t' && ti < 15) tag[ti++] = *q++;
+            tag[ti] = '\0';
+            while (q < p + len && (*q == ' ' || *q == '\t')) q++;
+            char *val = q;
+            int vlen = (int)(p + len - val);
+
+            if (strcmp(tag, "title") == 0) {
+                if (in_song && cur.title[0]) import_commit_song(&cur, &imported);
+                cur.nlines = 0;
+                cur.artist[0] = cur.album[0] = '\0';
+                song_copy(cur.title, val, vlen, SONG_TITLE_LEN);
+                in_song = 1;
+            } else if (strcmp(tag, "artist") == 0 && in_song) {
+                song_copy(cur.artist, val, vlen, SONG_ARTIST_LEN);
+            } else if (strcmp(tag, "album") == 0 && in_song) {
+                song_copy(cur.album, val, vlen, SONG_ALBUM_LEN);
+            } else if (strcmp(tag, "end") == 0) {
+                if (in_song && cur.title[0]) import_commit_song(&cur, &imported);
+                in_song = 0;
+            }
+            p = nxt; continue;
+        }
+
+        if (!in_song || cur.title[0] == '\0') { p = nxt; continue; }
+        if (cur.nlines < SONG_MAX_LINES) {
+            int k = cur.nlines++;
+            if (p[0] == '>') { cur.kind[k] = 1; song_copy(cur.line[k], p + 1, (int)(len - 1), SONG_LINE_LEN); }
+            else { cur.kind[k] = 0; song_copy(cur.line[k], p, (int)len, SONG_LINE_LEN); }
+        }
+        p = nxt;
+    }
+    if (in_song && cur.title[0]) import_commit_song(&cur, &imported);
+
+    FreePool(data);
+
+    if (imported == 0) {
+        gui_chat_add("> ไม่พบเพลงในไฟล์ (ต้องมี @title ... @end)");
+    } else {
+        char msg[64]; int mn = 0;
+        for (const char *q = "> นำเข้าแล้ว "; *q; q++) msg[mn++] = *q;
+        gui_itoa(imported, msg + mn); while (msg[mn]) mn++;
+        for (const char *q = " เพลง"; *q; q++) msg[mn++] = *q;
+        msg[mn] = '\0';
+        gui_chat_add(msg);
+    }
+    gui_open_song_picker();
+}
+
+static void gui_open_import_picker(void) {
+    gImportCount = 0;
+    if (dir_list_txt(gRoot, L"import\\", gImportPaths, PICKER_MAX_ITEMS,
+                     &gImportCount) != 0 || gImportCount == 0) {
+        gui_chat_add("> ไม่พบไฟล์ใน import/ (ใส่ text ไฟล์ @tag ไว้ก่อน)");
+        gui_repaint_chat();
+        return;
+    }
+    gPickerKind  = PICKER_IMPORT;
+    gPickerTitle = "นำเข้าเพลงจาก import/ (Enter นำเข้า, Esc กลับ)";
+    for (int i = 0; i < gImportCount; i++)
+        wchar16_to_utf8(gImportPaths[i], gPickerNames[i], 64);
+    gPickerCount = gImportCount;
+    gPickerSel = 0;
+    gPickerTop = 0;
+    gPickerOn  = 1;
+    if (mouse_available()) mouse_restore();
+    gui_draw_picker();
+}
+
+static int song_editor_rows(void) { return 3 + gEdNLines; }
+
+static void song_editor_clamp(void) {
+    int rows = song_editor_rows();
+    int vis  = song_view_visible_lines();
+    if (gSongEditSel < gSongEditTop) gSongEditTop = gSongEditSel;
+    if (gSongEditSel >= gSongEditTop + vis) gSongEditTop = gSongEditSel - vis + 1;
+    if (gSongEditTop < 0) gSongEditTop = 0;
+    int maxtop = rows - vis;
+    if (maxtop < 0) maxtop = 0;
+    if (gSongEditTop > maxtop) gSongEditTop = maxtop;
+}
+
+/* label / chord-marker prefix shown before each row's text */
+static const char *song_editor_prefix(int r) {
+    if (r == 0) return "ชื่อ: ";
+    if (r == 1) return "ศิลปิน: ";
+    if (r == 2) return "อัลบั้ม: ";
+    return gEdKind[r - 3] ? ">" : " ";
+}
+
+/* the committed text of row r (not the inline-editing buffer) */
+static const char *song_editor_field(int r) {
+    if (r == 0) return gEdTitle;
+    if (r == 1) return gEdArtist;
+    if (r == 2) return gEdAlbum;
+    return gEdLine[r - 3];
+}
+
+/* spacing cells in buf[0..pos), combining marks = 0 (for the caret column) */
+static int song_edit_cells_upto(const char *buf, int pos) {
+    const char *p = buf;
+    int cells = 0;
+    while (p < buf + pos) {
+        UINT32 cp = hrf_decode_utf8(&p);
+        const HRFONT_glyph_t *g = hrf_lookup(cp);
+        if (g != NULL && g->adv != 0) cells++;
+    }
+    return cells;
+}
+
+static void song_editor_draw(void) {
+    int W = (int)gFbWidth, H = (int)gFbHeight;
+    int m = 48, pad = 12;
+
+    fb_fill(0, 0, gFbWidth, gFbHeight, gColDesktop);
+
+    const char *hdr = (gSongEditIdx < 0) ? "เพิ่มเพลงใหม่" : "แก้ไขเพลง";
+    gui_text(m, m, hdr, gColAccent, gColDesktop);
+
+    int body_x = m;
+    int body_y = m + 2 * HRFONT_H + 16;
+    int footer_y = H - m - HRFONT_H;
+    int body_h = footer_y - 16 - body_y;
+    int body_w = W - 2 * m;
+    draw_filled_rect(body_x, body_y, body_w, body_h, gColChatBg);
+    draw_rect(body_x, body_y, body_w, body_h, gColBorder);
+
+    song_editor_clamp();
+    int vis = song_view_visible_lines();
+    int lx = body_x + pad;
+    int ly = body_y + pad;
+    int rows = song_editor_rows();
+
+    for (int i = 0; i < vis; i++) {
+        int r = gSongEditTop + i;
+        if (r >= rows) break;
+        int y = ly + i * HRFONT_H;
+        int cur = (r == gSongEditSel);
+        int editing = (cur && gSongEditInline == r);
+
+        const char *pfx = song_editor_prefix(r);
+        char row[192];
+        int n = 0;
+        while (*pfx && n < 190) row[n++] = *pfx++;
+        if (editing) {
+            for (int k = 0; k < gEditLen && n < 190; k++) row[n++] = gEditBuf[k];
+        } else {
+            const char *q = song_editor_field(r);
+            while (*q && n < 190) row[n++] = *q++;
+        }
+        row[n] = '\0';
+
+        if (cur) {
+            draw_filled_rect(body_x + 2, y, body_w - 4, HRFONT_H, gColAccent);
+            gui_text(lx, y, row, gColChatBg, gColAccent);
+            if (editing) {
+                int cells = gui_text_cells(song_editor_prefix(r))
+                          + song_edit_cells_upto(gEditBuf, gEditCaret);
+                int cx = lx + cells * HRFONT_W;
+                draw_filled_rect(cx, y, CARET_W, HRFONT_H, gColText);
+            }
+        } else {
+            UINT32 fg = (r >= 3 && gEdKind[r - 3]) ? gColAccent : gColText;
+            gui_text(lx, y, row, fg, gColChatBg);
+        }
+    }
+
+    gui_text(m, footer_y,
+             "Enter แก้  N เพิ่ม  Del ลบ  T คอร์ด/เนื้อ  S บันทึก  Esc ยกเลิก",
+             gColText, gColDesktop);
+}
+
+static void song_editor_commit(int r) {
+    gEditBuf[gEditLen] = '\0';
+    if      (r == 0) song_copy(gEdTitle,  gEditBuf, gEditLen, SONG_TITLE_LEN);
+    else if (r == 1) song_copy(gEdArtist, gEditBuf, gEditLen, SONG_ARTIST_LEN);
+    else if (r == 2) song_copy(gEdAlbum,  gEditBuf, gEditLen, SONG_ALBUM_LEN);
+    else             song_copy(gEdLine[r - 3], gEditBuf, gEditLen, SONG_LINE_LEN);
+}
+
+static void song_editor_start_inline(int r) {
+    const char *src = song_editor_field(r);
+    int n = 0;
+    while (src[n] && n < SONG_LINE_LEN - 1) { gEditBuf[n] = src[n]; n++; }
+    gEditBuf[n] = '\0';
+    gEditLen  = n;
+    gEditCaret = n;
+    gSongEditInline = r;
+}
+
+static void song_editor_inline_key(EFI_INPUT_KEY key) {
+    if (key.ScanCode == KBD_SCAN_F1) { gThaiMode = !gThaiMode; song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_ESC) { gSongEditInline = -1; song_editor_draw(); return; }
+    if (key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
+        song_editor_commit(gSongEditInline);
+        gSongEditInline = -1;
+        song_editor_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_LEFT)  { gEditCaret = grapheme_prev(gEditBuf, gEditCaret); song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_RIGHT) { gEditCaret = grapheme_next(gEditBuf, gEditLen, gEditCaret); song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_HOME)  { gEditCaret = 0; song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_END)   { gEditCaret = gEditLen; song_editor_draw(); return; }
+
+    CHAR16 ch = key.UnicodeChar;
+    if (ch == CHAR_BACKSPACE) {
+        int start = grapheme_prev(gEditBuf, gEditCaret);
+        if (start < gEditCaret) {
+            int n = gEditCaret - start;
+            memmove(gEditBuf + start, gEditBuf + gEditCaret,
+                    (UINTN)(gEditLen - gEditCaret + 1));
+            gEditLen -= n;
+            gEditCaret = start;
+            song_editor_draw();
+        }
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DELETE) {
+        int end = grapheme_next(gEditBuf, gEditLen, gEditCaret);
+        if (end > gEditCaret) {
+            int n = end - gEditCaret;
+            memmove(gEditBuf + gEditCaret, gEditBuf + end,
+                    (UINTN)(gEditLen - end + 1));
+            gEditLen -= n;
+            song_editor_draw();
+        }
+        return;
+    }
+    if (key.ScanCode != 0) return;
+    if (ch < 0x20 || ch >= 0x7f) return;
+
+    if (gThaiMode) {
+        UINT32 cp = gKedmanee[(unsigned char)ch];
+        if (cp == 0) cp = (UINT32)ch;
+        char enc[4];
+        int n = cp_to_utf8(cp, enc);
+        if (buf_insert(gEditBuf, &gEditLen, gEditCaret, enc, n, SONG_LINE_LEN))
+            gEditCaret += n;
+    } else {
+        char c = (char)ch;
+        if (buf_insert(gEditBuf, &gEditLen, gEditCaret, &c, 1, SONG_LINE_LEN))
+            gEditCaret += 1;
+    }
+    song_editor_draw();
+}
+
+static void song_editor_insert_line(void) {
+    if (gEdNLines >= SONG_MAX_LINES) return;
+    int at = gSongEditSel - 3;
+    if (at < 0) at = 0;
+    if (at > gEdNLines) at = gEdNLines;
+    for (int i = gEdNLines; i > at; i--) {
+        gEdKind[i] = gEdKind[i - 1];
+        memcpy(gEdLine[i], gEdLine[i - 1], SONG_LINE_LEN);
+    }
+    gEdKind[at] = 0;
+    gEdLine[at][0] = '\0';
+    gEdNLines++;
+    gSongEditSel = 3 + at;
+}
+
+static void song_editor_delete_line(void) {
+    int at = gSongEditSel - 3;
+    if (at < 0 || at >= gEdNLines) return;
+    for (int i = at; i < gEdNLines - 1; i++) {
+        gEdKind[i] = gEdKind[i + 1];
+        memcpy(gEdLine[i], gEdLine[i + 1], SONG_LINE_LEN);
+    }
+    gEdNLines--;
+    if (gSongEditSel >= song_editor_rows()) gSongEditSel = song_editor_rows() - 1;
+}
+
+static void song_editor_toggle_kind(void) {
+    int at = gSongEditSel - 3;
+    if (at < 0 || at >= gEdNLines) return;
+    gEdKind[at] = !gEdKind[at];
+}
+
+static void song_editor_cancel(void) {
+    gSongEditOn = 0;
+    gui_open_song_picker();
+}
+
+static void song_editor_save(void) {
+    int idx = gSongEditIdx;
+    int is_new = (idx < 0);
+    if (is_new) {
+        if (gSongCount >= SONGS_MAX) { song_editor_cancel(); return; }
+        idx = gSongCount;
+    }
+    Song *s = &gCurSong;
+    song_copy(s->title,  gEdTitle,  (int)strlen(gEdTitle),  SONG_TITLE_LEN);
+    song_copy(s->artist, gEdArtist, (int)strlen(gEdArtist), SONG_ARTIST_LEN);
+    song_copy(s->album,  gEdAlbum,  (int)strlen(gEdAlbum),  SONG_ALBUM_LEN);
+    s->nlines = gEdNLines;
+    for (int i = 0; i < gEdNLines; i++) {
+        s->kind[i] = gEdKind[i];
+        song_copy(s->line[i], gEdLine[i], (int)strlen(gEdLine[i]), SONG_LINE_LEN);
+    }
+
+    if (is_new) {
+        song_make_fname(gSongs[idx].fname, song_next_number());
+    }
+
+    /* update the index row */
+    song_copy(gSongs[idx].title,  s->title,  (int)strlen(s->title),  SONG_TITLE_LEN);
+    song_copy(gSongs[idx].artist, s->artist, (int)strlen(s->artist), SONG_ARTIST_LEN);
+    song_copy(gSongs[idx].album,  s->album,  (int)strlen(s->album),  SONG_ALBUM_LEN);
+
+    song_write_file(gRoot, gSongs[idx].fname, s);
+    if (is_new) gSongCount++;
+
+    gSongEditOn = 0;
+    gui_open_song_picker();   /* refresh the list and return to the picker */
+}
+
+static void song_editor_open(int idx) {
+    gSongEditIdx = idx;
+    if (idx < 0) {
+        gEdTitle[0] = gEdArtist[0] = gEdAlbum[0] = '\0';
+        gEdNLines = 0;
+    } else {
+        song_body_load(idx);                       /* lazy-load the lyrics */
+        Song *s = &gCurSong;
+        memcpy(gEdTitle,  s->title,  SONG_TITLE_LEN);
+        memcpy(gEdArtist, s->artist, SONG_ARTIST_LEN);
+        memcpy(gEdAlbum,  s->album,  SONG_ALBUM_LEN);
+        gEdNLines = s->nlines;
+        for (int i = 0; i < s->nlines; i++) {
+            gEdKind[i] = s->kind[i];
+            memcpy(gEdLine[i], s->line[i], SONG_LINE_LEN);
+        }
+    }
+    gSongEditSel    = 0;
+    gSongEditTop    = 0;
+    gSongEditInline = -1;
+    gSongEditOn     = 1;
+    if (mouse_available()) mouse_restore();
+    song_editor_draw();
+}
+
+static void song_editor_key(EFI_INPUT_KEY key) {
+    if (gSongEditInline >= 0) { song_editor_inline_key(key); return; }
+
+    int rows = song_editor_rows();
+    if (key.ScanCode == KBD_SCAN_F1) { gThaiMode = !gThaiMode; song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_UP) {
+        if (gSongEditSel > 0) { gSongEditSel--; song_editor_draw(); }
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_DOWN) {
+        if (gSongEditSel < rows - 1) { gSongEditSel++; song_editor_draw(); }
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_PAGEUP) {
+        gSongEditSel -= song_view_visible_lines();
+        if (gSongEditSel < 0) gSongEditSel = 0;
+        song_editor_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_PAGEDOWN) {
+        gSongEditSel += song_view_visible_lines();
+        if (gSongEditSel >= rows) gSongEditSel = rows - 1;
+        song_editor_draw();
+        return;
+    }
+    if (key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
+        song_editor_start_inline(gSongEditSel);
+        song_editor_draw();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_ESC) { song_editor_cancel(); return; }
+
+    CHAR16 ch = key.UnicodeChar;
+    if (ch == 'n' || ch == 'N') { song_editor_insert_line(); song_editor_draw(); return; }
+    if (key.ScanCode == KBD_SCAN_DELETE) { song_editor_delete_line(); song_editor_draw(); return; }
+    if (ch == 't' || ch == 'T') { song_editor_toggle_kind(); song_editor_draw(); return; }
+    if (ch == 's' || ch == 'S') { song_editor_save(); return; }
+}
+
+static void song_delete_draw(void) {
+    int W = (int)gFbWidth, H = (int)gFbHeight;
+    fb_fill(0, 0, gFbWidth, gFbHeight, gColDesktop);
+
+    const char *title = gSongs[gDelSongIdx].title;
+    int w = gui_text_cells(title) * HRFONT_W + 8 * HRFONT_W;
+    if (w < 420) w = 420;
+    if (w > W - 96) w = W - 96;
+    int h = 4 * HRFONT_H + 40;
+    int x = (W - w) / 2, y = (H - h) / 2;
+
+    draw_filled_rect(x, y, w, h, gColChatBg);
+    draw_rect(x, y, w, h, gColAccent);
+
+    char msg[160]; int n = 0;
+    const char *p = "ลบเพลง \""; while (*p && n < 150) msg[n++] = *p++;
+    for (const char *q = title; *q && n < 150; q++) msg[n++] = *q;
+    const char *p2 = "\" ?"; while (*p2 && n < 150) msg[n++] = *p2++;
+    msg[n] = '\0';
+    gui_text(x + 24, y + 16, msg, gColText, gColChatBg);
+    gui_text(x + 24, y + 16 + HRFONT_H, "Enter = ลบ  /  Esc = ยกเลิก",
+             gColAccent, gColChatBg);
+}
+
+static void song_delete_confirm_show(int idx) {
+    gDelConfirm = 1;
+    gDelSongIdx = idx;
+    if (mouse_available()) mouse_restore();
+    song_delete_draw();
+}
+
+static void song_delete_key(EFI_INPUT_KEY key) {
+    if (key.UnicodeChar == CHAR_CARRIAGE_RETURN) {
+        file_delete(gRoot, gSongs[gDelSongIdx].fname);
+        for (int i = gDelSongIdx; i < gSongCount - 1; i++)
+            gSongs[i] = gSongs[i + 1];
+        gSongCount--;
+        gDelConfirm = 0;
+        gui_open_song_picker();
+        return;
+    }
+    if (key.ScanCode == KBD_SCAN_ESC) {
+        gDelConfirm = 0;
+        gui_open_song_picker();
+        return;
+    }
 }
 
 static void process_slash_command(char *input) {
@@ -4889,6 +6234,7 @@ static void process_slash_command(char *input) {
         gui_chat_add(">   /loadmodel       pick a model (up/down + Enter)");
         gui_chat_add(">   /listmodel       list available models");
         gui_chat_add(">   /train           enter training mode");
+        gui_chat_add(">   /songs           สมุดเพลง (เนื้อ + คอร์ด, แก้/เพิ่ม/ลบได้)");
         gui_chat_add(">   /games           pick a game (up/down + Enter)");
         gui_chat_add(">   /games pacman    play Pacman (classic map)");
         gui_chat_add(">   /games pacman auto   Pacman, AI plays itself");
@@ -4911,6 +6257,8 @@ static void process_slash_command(char *input) {
     } else if (strcmp(cmd, "train") == 0) {
         gTrainingMode = 1;
         gui_chat_add("> training mode ON (placeholder)");
+    } else if (strcmp(cmd, "songs") == 0) {
+        gui_open_song_picker();            /* สมุดเพลง: เลือกเพลง + เนื้อ/คอร์ด */
     } else if (strcmp(cmd, "games") == 0) {
         if (!arg || !*arg) {
             gui_open_game_picker();       /* no arg -> drop-down to pick a game */
@@ -4960,6 +6308,7 @@ static void gui_chat_show_usage(void) {
     gui_chat_add("> พิมพ์คำถาม แล้วกด Enter เพื่อถาม AI");
     gui_chat_add("> จำไว้: คำถาม = คำตอบ  เพื่อสอนความรู้ใหม่");
     gui_chat_add("> /games pacman  เล่นเกมแพคแมน");
+    gui_chat_add("> /songs  สมุดเพลง เนื้อ+คอร์ด (Enter เปิด, N เพิ่ม, E แก้, Del ลบ)");
     gui_chat_add("> /help  แสดงคำสั่งทั้งหมด");
     gui_chat_add("> /clear  ล้างข้อความบนจอ");
     gui_chat_add("> /reboot  รีสตาร์ตเครื่อง");
@@ -5276,6 +6625,7 @@ static void screensaver_exit(void) {
 
 static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
     gRoot = root;
+    songs_load(root);          /* สมุดเพลง: parse songs.txt once at startup */
     for (;;) {
         /* Game mode: run the active game instead of the chat loop. */
         if (gGameMode != GAME_MODE_NONE) {
@@ -5290,6 +6640,33 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
                     gui_game_tick();
                 }
             }
+            uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            continue;
+        }
+
+        /* Song viewer: full-screen chords+lyrics; Esc returns to the chat. */
+        if (gSongViewOn) {
+            EFI_INPUT_KEY key;
+            EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
+            if (ks == EFI_SUCCESS) song_view_key(key);
+            uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            continue;
+        }
+
+        /* Song editor: add/edit a song; S saves, Esc cancels. */
+        if (gSongEditOn) {
+            EFI_INPUT_KEY key;
+            EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
+            if (ks == EFI_SUCCESS) song_editor_key(key);
+            uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
+            continue;
+        }
+
+        /* Delete-song confirmation dialog. */
+        if (gDelConfirm) {
+            EFI_INPUT_KEY key;
+            EFI_STATUS ks = uefi_call_wrapper(ConIn->ReadKeyStroke, 2, ConIn, &key);
+            if (ks == EFI_SUCCESS) song_delete_key(key);
             uefi_call_wrapper(BS->Stall, 1, GUI_POLL_US);
             continue;
         }
@@ -5323,6 +6700,13 @@ static void gui_run(SIMPLE_INPUT_INTERFACE *ConIn, EFI_FILE_HANDLE root) {
         /* A key may have started a game (e.g. Enter on the /games picker): hand
          * straight to the game loop so the chat caret/mouse don't paint over it. */
         if (gGameMode != GAME_MODE_NONE) continue;
+
+        /* Same for the song viewer (Enter on the /songs picker). */
+        if (gSongViewOn) continue;
+
+        /* Same for the song editor / delete dialog (N/E/Del on the picker). */
+        if (gSongEditOn) continue;
+        if (gDelConfirm) continue;
 
         /* While the model picker is up it owns the whole screen: skip mouse
          * polling, caret blink and the screensaver timer until it closes. */
