@@ -287,6 +287,125 @@ fail:
 }
 
 /* ----------------------------------------------------------------------------
+ * Self-contained file helpers: append_to_file() and load_file_to_memory().
+ *
+ * Two thin entry points over EFI_FILE_PROTOCOL that locate the boot volume's
+ * Simple File System themselves, so callers don't have to thread ImageHandle or
+ * a root handle through the code.  The root directory is cached in gBootRoot
+ * (set once in efi_main() from the real boot device); fs_open_root() falls back
+ * to BS->LocateProtocol() only if that has not happened yet.
+ * ------------------------------------------------------------------------- */
+
+static EFI_FILE_HANDLE gBootRoot = NULL;   /* cached root dir; set in efi_main() */
+
+/* Locate the Simple File System Protocol and open its root volume (once). */
+static EFI_STATUS fs_open_root(void) {
+    EFI_STATUS status;
+
+    if (gBootRoot != NULL) return EFI_SUCCESS;   /* already open */
+
+    EFI_GUID fsGuid = SIMPLE_FILE_SYSTEM_PROTOCOL;
+    EFI_FILE_IO_INTERFACE *io = NULL;
+    status = uefi_call_wrapper(BS->LocateProtocol, 3, &fsGuid, NULL,
+                               (VOID **)&io);
+    if (EFI_ERROR(status) || io == NULL) return EFI_NOT_FOUND;
+
+    status = uefi_call_wrapper(io->OpenVolume, 2, io, &gBootRoot);
+    if (EFI_ERROR(status) || gBootRoot == NULL) return EFI_NOT_FOUND;
+
+    return EFI_SUCCESS;
+}
+
+/* Append a NUL-terminated UTF-8 string to `filename` on the boot volume.
+ *
+ *   1. Locate the Simple File System and open its root volume.
+ *   2. Open `filename` for read/write, creating it if it does not exist.
+ *   3. Move the file pointer to the end of the file.
+ *   4. Write the UTF-8 text, flush and close the handle.
+ *
+ * Returns EFI_SUCCESS on success, or the UEFI error status on failure. */
+EFI_STATUS append_to_file(CHAR16 *filename, char *text) {
+    EFI_STATUS status;
+    EFI_FILE_HANDLE file = NULL;
+
+    if (filename == NULL || text == NULL) return EFI_INVALID_PARAMETER;
+
+    status = fs_open_root();
+    if (EFI_ERROR(status)) return status;
+
+    UINT64 mode = EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE;
+    status = uefi_call_wrapper(gBootRoot->Open, 5, gBootRoot, &file, filename,
+                               mode, 0);
+    if (EFI_ERROR(status) || file == NULL) return status;
+
+    /* Move the file pointer to the end of the file.  gnu-efi does not export
+     * EDK2's EFI_FILE_POSITION_END_OF_FILE sentinel, so we do the documented
+     * equivalent: read the current size via GetInfo, then SetPosition to it. */
+    EFI_FILE_INFO *info = AllocateZeroPool(SIZE_OF_EFI_FILE_INFO + 256);
+    if (info == NULL) {
+        uefi_call_wrapper(file->Close, 1, file);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN info_size = SIZE_OF_EFI_FILE_INFO + 256;
+    EFI_GUID fiGuid = EFI_FILE_INFO_ID;
+    status = uefi_call_wrapper(file->GetInfo, 4, file, &fiGuid, &info_size, info);
+    if (status == EFI_BUFFER_TOO_SMALL) {
+        FreePool(info);
+        info = AllocateZeroPool(info_size);
+        if (info == NULL) {
+            uefi_call_wrapper(file->Close, 1, file);
+            return EFI_OUT_OF_RESOURCES;
+        }
+        status = uefi_call_wrapper(file->GetInfo, 4, file, &fiGuid, &info_size, info);
+    }
+    if (EFI_ERROR(status)) {
+        FreePool(info);
+        uefi_call_wrapper(file->Close, 1, file);
+        return status;
+    }
+    status = uefi_call_wrapper(file->SetPosition, 2, file, (UINT64)info->FileSize);
+    FreePool(info);
+    if (EFI_ERROR(status)) {
+        uefi_call_wrapper(file->Close, 1, file);
+        return status;
+    }
+
+    UINTN len = strlen(text);
+    UINTN written = len;
+    status = uefi_call_wrapper(file->Write, 3, file, &written, (VOID *)text);
+    if (!EFI_ERROR(status) && written != len) status = EFI_BAD_BUFFER_SIZE;
+
+    uefi_call_wrapper(file->Flush, 1, file);
+    uefi_call_wrapper(file->Close, 1, file);
+    return status;
+}
+
+/* Read the entire file `filename` into freshly allocated pool memory.
+ *
+ *   1. Locate the Simple File System and open its root volume.
+ *   2. Get the file size, allocate a buffer with AllocatePool, and read the
+ *      whole file into it.
+ *
+ * On success *buffer points to the data (free it with FreePool) and *size is
+ * its byte length.  Returns EFI_SUCCESS, or the UEFI error status on failure. */
+EFI_STATUS load_file_to_memory(CHAR16 *filename, VOID **buffer, UINTN *size) {
+    EFI_STATUS status;
+
+    if (buffer == NULL || size == NULL) return EFI_INVALID_PARAMETER;
+    *buffer = NULL;
+    *size = 0;
+
+    status = fs_open_root();
+    if (EFI_ERROR(status)) return status;
+
+    /* read_file() allocates with AllocatePool (not AllocatePages: freeing a
+     * large page block with BS->FreePages hangs OVMF) and handles the whole
+     * open / size / read / close sequence. */
+    return read_file(gBootRoot, filename, 0, buffer, size);
+}
+
+/* ----------------------------------------------------------------------------
  * Transformer model (structs and weight layout identical to llama2.c)
  * ------------------------------------------------------------------------- */
 
@@ -788,20 +907,6 @@ static void gen_emit(const char *piece) {
     }
 }
 
-static void safe_print(char *piece) {
-    // piece might be a raw byte token, and we only want to print printable chars
-    // or whitespace, because some bytes are control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    if (piece[1] == '\0') {
-        unsigned char byte_val = (unsigned char)piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // bad byte, don't print it
-        }
-    }
-    gen_emit(piece);
-}
-
 /* Simple freestanding qsort/bsearch (element types are <= 32 bytes here). */
 
 static void qs_impl(unsigned char *a, int lo, int hi, int size,
@@ -1115,6 +1220,12 @@ static UINTN   gFbSize = 0;           /* bytes, from Mode->FrameBufferSize */
 UINT32  gFbWidth = 0;         /* extern in hrfont.h */
 UINT32  gFbHeight = 0;        /* extern in hrfont.h */
 UINT32  gFbScanLine = 0;      /* PixelsPerScanLine (>= width); extern in hrfont.h */
+
+/* Negotiated GOP resolution, consumed by the responsive UI layout.  These
+ * mirror gFbWidth/gFbHeight but are the canonical names the layout reads, so
+ * the GUI scales to whatever mode init_gop() selects. */
+UINT32  g_screen_width  = 0;
+UINT32  g_screen_height = 0;
 static EFI_GRAPHICS_PIXEL_FORMAT gFbFormat = PixelBltOnly;
 static EFI_PIXEL_BITMASK gFbMask;
 
@@ -1678,6 +1789,11 @@ static EFI_STATUS init_gop(void) {
     gFbWidth    = info->HorizontalResolution;
     gFbHeight   = info->VerticalResolution;
     gFbScanLine = info->PixelsPerScanLine;
+
+    /* Expose the negotiated resolution to the responsive UI layout. */
+    g_screen_width  = gFbWidth;
+    g_screen_height = gFbHeight;
+
     gFbBase     = (UINT8 *)(UINTN)gGop->Mode->FrameBufferBase;
     gFbSize     = gGop->Mode->FrameBufferSize;
 
@@ -2043,66 +2159,287 @@ static int __attribute__((unused)) read_line(SIMPLE_INPUT_INTERFACE *ConIn, char
 }
 
 /* ----------------------------------------------------------------------------
- * generation loop
+ * Skills (function-calling / tool use)
+ *
+ * The model is told (via the hidden system prompt below) to answer certain
+ * requests by emitting a literal "<skill>NAME</skill>" tag.  The generation loop
+ * routes every decoded token piece through skill_route(), a byte-level state
+ * machine that:
+ *
+ *   - NORMAL mode  : scans for "<skill>", holding the partial match back so the
+ *                    tag is never drawn to the framebuffer.
+ *   - SKILL mode   : buffers bytes into gSkillBuf (fixed size, no allocation)
+ *                    until "</skill>", then calls skill_execute().
+ *
+ * skill_execute() turns the captured name into "/NAME" and hands it to the
+ * existing slash-command parser process_slash_command().
  * ------------------------------------------------------------------------- */
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
-    if (prompt == NULL) { prompt = empty_prompt; }
+#define SKILL_OPEN       "<skill>"
+#define SKILL_CLOSE      "</skill>"
+#define SKILL_OPEN_LEN   7
+#define SKILL_CLOSE_LEN  8
+#define SKILL_BUF_MAX    64     /* longest skill name (static buffer, no alloc) */
+
+/* Hidden system prompt: fed to the model on turn one, never displayed. */
+static const char gSkillSystemPrompt[] =
+    "You are an OS assistant. If the user asks to clear the screen reply exactly "
+    "<skill>clear</skill>. If the user asks to reboot reply <skill>reboot</skill>. "
+    "If the user asks to power off reply <skill>shutdown</skill>. Otherwise answer "
+    "normally.";
+
+static char gSkillBuf[SKILL_BUF_MAX];   /* bytes between <skill> and </skill>   */
+static int  gSkillLen    = 0;
+static int  gInSkill     = 0;           /* 1 while inside <skill>...</skill>     */
+static int  gOpenMatch   = 0;           /* matched prefix of SKILL_OPEN so far   */
+static int  gCloseMatch  = 0;           /* matched prefix of SKILL_CLOSE so far  */
+
+/* Defined later, in the slash-command section. */
+static void process_slash_command(char *input);
+
+static void skill_reset(void) {
+    gInSkill = 0;
+    gOpenMatch = 0;
+    gCloseMatch = 0;
+    gSkillLen = 0;
+    gSkillBuf[0] = '\0';
+}
+
+/* Emit one byte as ordinary model text (drop stray control bytes; keep UTF-8). */
+static void skill_emit_byte(unsigned char c) {
+    if (c < 0x80 && !isprint(c) && !isspace(c)) return;   /* same rule as safe_print() */
+    char one[2];
+    one[0] = (char)c;
+    one[1] = '\0';
+    gen_emit(one);
+}
+
+/* Append one byte to the skill name (bounded; overflow is silently dropped). */
+static void skill_push_name(char c) {
+    if (gSkillLen < SKILL_BUF_MAX - 1) {
+        gSkillBuf[gSkillLen++] = c;
+        gSkillBuf[gSkillLen] = '\0';
+    }
+}
+
+/* A complete "</skill>" was seen: parse the name and run the matching command. */
+static void skill_execute(void) {
+    gSkillBuf[gSkillLen] = '\0';
+
+    /* trim surrounding whitespace from the captured name */
+    char *s = gSkillBuf;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    char *e = s;
+    while (*e) e++;
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+
+    /* build "/NAME" (fixed buffer) and hand off to the slash-command parser */
+    char cmd[SKILL_BUF_MAX + 2];
+    cmd[0] = '/';
+    int n = 1;
+    for (char *p = s; p < e && n < (int)sizeof(cmd) - 1; p++) cmd[n++] = *p;
+    cmd[n] = '\0';
+
+    if (n > 1) {
+        process_slash_command(cmd);
+        /* Echo a confirmation into the reply stream so the GUI shows the skill
+         * ran (instead of falling back to "ไม่ทราบ" for an empty reply). */
+        gen_emit("[skill: ");
+        gen_emit(cmd + 1);   /* skip the leading '/' */
+        gen_emit("]");
+    }
+
+    skill_reset();
+}
+
+/* Feed one decoded byte through the <skill> state machine. */
+static void skill_consume_byte(unsigned char c) {
+    for (;;) {
+        if (!gInSkill) {
+            /* NORMAL: scan for "<skill>", holding the partial match back. */
+            if (gOpenMatch) {
+                if (c == SKILL_OPEN[gOpenMatch]) {
+                    if (++gOpenMatch == SKILL_OPEN_LEN) {
+                        gOpenMatch = 0;
+                        gInSkill = 1;
+                        gSkillLen = 0;
+                        gCloseMatch = 0;
+                    }
+                    return;
+                }
+                /* mismatch: flush the held prefix, then re-examine c */
+                for (int i = 0; i < gOpenMatch; i++)
+                    skill_emit_byte((unsigned char)SKILL_OPEN[i]);
+                gOpenMatch = 0;
+                continue;
+            }
+            if (c == SKILL_OPEN[0]) { gOpenMatch = 1; return; }
+            skill_emit_byte(c);
+            return;
+        } else {
+            /* IN SKILL: capture the name, scan for "</skill>". */
+            if (gCloseMatch) {
+                if (c == SKILL_CLOSE[gCloseMatch]) {
+                    if (++gCloseMatch == SKILL_CLOSE_LEN) {
+                        gInSkill = 0;
+                        gCloseMatch = 0;
+                        skill_execute();
+                    }
+                    return;
+                }
+                /* the "</..." prefix was actually part of the skill name */
+                for (int i = 0; i < gCloseMatch; i++) skill_push_name(SKILL_CLOSE[i]);
+                gCloseMatch = 0;
+                continue;
+            }
+            if (c == SKILL_CLOSE[0]) { gCloseMatch = 1; return; }
+            skill_push_name(c);
+            return;
+        }
+    }
+}
+
+/* Route one decoded token piece through the skill scanner. */
+static void skill_route(const char *piece) {
+    if (piece == NULL || piece[0] == '\0') return;
+    for (const char *p = piece; *p; p++)
+        skill_consume_byte((unsigned char)*p);
+}
+
+/* Emit any dangling state (e.g. an unclosed tag at EOS) as literal text. */
+static void skill_flush(void) {
+    for (int i = 0; i < gOpenMatch; i++)
+        skill_emit_byte((unsigned char)SKILL_OPEN[i]);
+    if (gInSkill) {
+        for (int i = 0; i < SKILL_OPEN_LEN; i++)
+            skill_emit_byte((unsigned char)SKILL_OPEN[i]);
+        for (int i = 0; i < gSkillLen; i++)
+            skill_emit_byte((unsigned char)gSkillBuf[i]);
+        for (int i = 0; i < gCloseMatch; i++)
+            skill_emit_byte((unsigned char)SKILL_CLOSE[i]);
+    }
+    skill_reset();
+}
+
+/* ----------------------------------------------------------------------------
+ * generation loop (multi-turn)
+ *
+ * Unlike the original single-turn loop, the KV cache is NOT discarded between
+ * prompts.  The running conversation lives in gCtxTokens[] (the token ids) and
+ * the model's key/value cache; a new user prompt is tokenised, appended to the
+ * array, and only the new tokens are pushed through forward().  When appending
+ * would overflow seq_len, the context is reset and this turn becomes turn one.
+ * ------------------------------------------------------------------------- */
+
+#define CHAT_CTX_MAX 512   /* upper bound on stored context tokens            */
+
+/* Running multi-turn conversation state.  gCtxTokens[0..gCtxLen) mirrors the
+ * KV cache one-to-one: token i sits at KV position i. */
+static int gCtxTokens[CHAT_CTX_MAX];
+static int gCtxLen    = 0;              /* tokens currently held in the KV cache */
+static int gCtxSeqLen = CHAT_CTX_MAX;   /* effective cap, set after model load   */
+
+/* Forget the whole conversation (also called when a checkpoint is swapped). */
+static void chat_context_reset(void) {
+    gCtxLen = 0;
+}
+
+/* Build this turn's prompt string: chat-template separators + the user text +
+ * the AI reply prefix.  Returns the byte length (excluding the NUL). */
+static int build_turn_prompt(char *dst, int dst_sz, const char *user) {
+    int n = 0;
+    if (gCtxLen == 0) {
+        /* turn one: hidden system prompt first, then the user turn */
+        for (const char *p = gSkillSystemPrompt; *p && n < dst_sz - 1; p++) dst[n++] = *p;
+        for (const char *p = "\nUser: "; *p && n < dst_sz - 1; p++) dst[n++] = *p;
+    } else {
+        for (const char *p = "\nUser: "; *p && n < dst_sz - 1; p++) dst[n++] = *p;
+    }
+    for (; *user && n < dst_sz - 1; user++) dst[n++] = *user;
+    for (const char *p = "\nAI: "; *p && n < dst_sz - 1; p++) dst[n++] = *p;
+    dst[n] = '\0';
+    return n;
+}
+
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+              char *prompt, int steps) {
+    if (prompt == NULL) return;
 
     if (gGenCapture) { gGenLen = 0; gGenBuf[0] = '\0'; }   /* fresh capture */
+    skill_reset();                                        /* fresh skill scan  */
 
-    // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = AllocatePool((strlen(prompt) + 3) * sizeof(int));
-    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    if (num_prompt_tokens < 1) {
-        fb_puts("error: something is wrong, expected at least 1 prompt token\n");
+    int seq_limit = gCtxSeqLen;
+    if (seq_limit < 1) seq_limit = CHAT_CTX_MAX;
+    if (steps < 1) steps = 1;
+
+    /* 1. Build + tokenise this turn. */
+    char turn[1024];
+    build_turn_prompt(turn, (int)sizeof(turn), prompt);
+
+    int num_turn = 0;
+    int *turn_tokens = AllocatePool((strlen(turn) + 3) * sizeof(int));
+    encode(tokenizer, turn, (gCtxLen == 0) ? 1 : 0, 0, turn_tokens, &num_turn);
+    if (num_turn < 1) {
+        FreePool(turn_tokens);
+        fb_puts("error: expected at least 1 prompt token\n");
         return;
     }
 
-    // start the main loop
-    UINT64 start = 0;  // used to time our code, only initialized after first iteration
-    int next;          // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;       // position in the sequence
-    while (pos < steps) {
+    /* 2. Context limit: if the new turn plus a one-token reply can't fit, reset
+     *    the conversation and re-encode as a fresh first turn. */
+    if (gCtxLen + num_turn + 1 > seq_limit) {
+        chat_context_reset();
+        FreePool(turn_tokens);
+        build_turn_prompt(turn, (int)sizeof(turn), prompt);
+        num_turn = 0;
+        turn_tokens = AllocatePool((strlen(turn) + 3) * sizeof(int));
+        encode(tokenizer, turn, 1, 0, turn_tokens, &num_turn);
+        if (num_turn < 1) { FreePool(turn_tokens); return; }
+        /* A single turn longer than the whole context: clamp and keep going. */
+        if (num_turn >= seq_limit) num_turn = seq_limit - 1;
+        if (num_turn < 1) { FreePool(turn_tokens); return; }
+    }
 
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+    /* 3. Cap the reply length to the remaining context budget. */
+    int room = seq_limit - gCtxLen - num_turn;
+    int max_gen = steps;
+    if (max_gen > room) max_gen = room;
+    if (max_gen < 1) max_gen = 1;
 
-        // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
-            next = prompt_tokens[pos + 1]; // still processing the input prompt
-        } else {
-            next = sample(sampler, logits);
-        }
+    /* 4. Token concatenation: append the new turn tokens to the context array. */
+    int old_len = gCtxLen;
+    for (int i = 0; i < num_turn; i++) gCtxTokens[old_len + i] = turn_tokens[i];
+    gCtxLen = old_len + num_turn;
+    FreePool(turn_tokens);
+
+    /* 5. KV-cache retention: push only the new tokens through forward().  No
+     *    sampling and no output here — the prompt is not re-echoed. */
+    int token = 0;
+    for (int i = 0; i < num_turn; i++) {
+        token = gCtxTokens[old_len + i];
+        forward(transformer, token, old_len + i);
+    }
+    int pos = gCtxLen;   /* next free KV position */
+
+    /* 6. Sample the reply, appending each generated token to the context. */
+    int emitted = 0;
+    while (emitted < max_gen) {
+        float *logits = forward(transformer, token, pos);
+        int next = sample(sampler, logits);
         pos++;
+        if (next == 2) break;              /* EOS (</s>) ends the reply */
 
-        // data-dependent terminating condition: the EOS (</s> = 2) token ends the
-        // reply.  (This vocab is <unk>=0, <s>=1, </s>=2, so 2 — not 1 — is EOS.)
-        if (next == 2) { break; }
-
-        // print the token as string, decode it with the Tokenizer object
-        char* piece = decode(tokenizer, token, next);
-        safe_print(piece);
+        char *piece = decode(tokenizer, token, next);
+        skill_route(piece);                /* intercept <skill>…</skill>, else emit */
         token = next;
 
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
-    }
-    if (!gGenCapture) {
-        fb_putc('\n');
-
-        // report achieved tok/s (pos-1 because the timer starts after first iteration)
-        if (pos > 1) {
-            UINT64 end = time_in_ms();
-            fb_printf("achieved tok/s: %f\n",
-                      (double)(pos - 1) / (double)(end - start) * 1000.0);
-        }
+        gCtxTokens[gCtxLen] = next;        /* keep the token in the context      */
+        gCtxLen++;
+        emitted++;
     }
 
-    FreePool(prompt_tokens);
+    skill_flush();                         /* emit any dangling partial tag text  */
+    if (!gGenCapture) fb_putc('\n');
 }
 
 /* ----------------------------------------------------------------------------
@@ -2803,31 +3140,49 @@ static void gui_draw_emotion(void) {
  * 3b. Layout, then the chat log, input box and Send button.
  * ------------------------------------------------------------------------- */
 
-static void gui_layout(void) {
-    int W = (int)gFbWidth, H = (int)gFbHeight;
-    int m = 48;          /* outer margin */
-    int ih = 112;        /* input box height */
-    int gap = 40;        /* gap between chat window and input row */
-    int btn_w = 336;     /* Send button width */
-    int in_gap = 16;     /* gap between input box and Send button */
+/* Responsive layout: every UI element's geometry is derived from the negotiated
+ * screen size, so the GUI fits any laptop or PC monitor.
+ *
+ *   - Status bar        : full-width strip across the very top.
+ *   - Chat History win. : 90% of screen width, centred, 20px from the top
+ *                         (just below the status bar).
+ *   - Text Input box    : anchored 50px from the bottom of the screen.
+ *   - Send button       : to the right of the input box, on the same baseline. */
+static void calculate_ui_layout(void) {
+    int W = (int)g_screen_width;
+    int H = (int)g_screen_height;
 
+    /* Status bar: live mouse-coordinate readout across the top. */
     gStatusBar.x = 0;
     gStatusBar.y = 0;
     gStatusBar.w = W;
-    gStatusBar.h = GUI_STATUS_H;   /* top strip: live mouse-coordinate readout */
+    gStatusBar.h = GUI_STATUS_H;
 
-    gChatBox.x = m;
-    gChatBox.y = m;
-    gChatBox.w = W - 2 * m;
-    gChatBox.h = H - 2 * m - ih - gap;
+    /* Chat History window: 90% of the screen width, horizontally centred,
+     * 20px from the top (the status bar occupies the top GUI_STATUS_H px). */
+    int chat_w = W * 90 / 100;               /* 90% of screen width   */
+    int chat_x = (W - chat_w) / 2;           /* centred               */
+    int chat_y = GUI_STATUS_H + 20;          /* 20px from the top     */
 
-    gInputBox.x = m;
-    gInputBox.y = H - m - ih;
-    gInputBox.w = W - 2 * m - btn_w - in_gap;
+    /* Input row: Text Input box anchored 50px from the bottom. */
+    int ih      = 112;                        /* input box height     */
+    int btn_w   = 336;                        /* Send button width    */
+    int in_gap  = 16;                         /* input <-> Send gap   */
+    int gap     = 40;                         /* chat <-> input gap   */
+    int input_y = H - 50 - ih;                /* 50px from the bottom */
+
+    gChatBox.x = chat_x;
+    gChatBox.y = chat_y;
+    gChatBox.w = chat_w;
+    gChatBox.h = input_y - gap - chat_y;
+
+    gInputBox.x = chat_x;
+    gInputBox.y = input_y;
+    gInputBox.w = chat_w - btn_w - in_gap;
     gInputBox.h = ih;
 
-    gSendButton.x = W - m - btn_w;
-    gSendButton.y = H - m - ih;
+    gSendButton.x = chat_x + chat_w - btn_w;
+    gSendButton.y = input_y;
     gSendButton.w = btn_w;
     gSendButton.h = ih;
 }
@@ -3354,6 +3709,11 @@ static void load_new_model(const char *filename) {
     if (gModelLoaded) free_transformer(&gTransformer);
     gTransformer = next;
     gModelLoaded = 1;
+
+    /* New model -> new KV cache, so the old conversation is meaningless. */
+    chat_context_reset();
+    gCtxSeqLen = (next.config.seq_len < CHAT_CTX_MAX)
+               ? next.config.seq_len : CHAT_CTX_MAX;
 
     char buf[96];
     int n = 0;
@@ -6329,6 +6689,52 @@ static void gui_chat_show_usage(void) {
     gui_chat_add("> /shutdown  ปิดเครื่อง");
 }
 
+/* Case-insensitive (ASCII) substring test.  Thai UTF-8 bytes (>= 0x80) compare
+ * exactly, so this doubles as a byte-level substring search for Thai words. */
+static int skill_str_has(const char *s, const char *sub) {
+    if (s == NULL || sub == NULL || sub[0] == '\0') return 0;
+    for (const char *p = s; *p; p++) {
+        const char *a = p, *b = sub;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+            if (ca != cb) break;
+            a++; b++;
+        }
+        if (*b == '\0') return 1;
+    }
+    return 0;
+}
+
+/* Deterministic natural-language -> skill mapping.  The model usually won't
+ * emit <skill> tags on its own (it isn't instruction-tuned), so common requests
+ * are matched by keyword here and routed straight to the slash-command parser.
+ * Returns a writable "/command" string, or NULL when nothing matches. */
+static char gSkillCmdBuf[32];
+
+static char *gui_skill_command(const char *s) {
+    if (s == NULL) return NULL;
+    const char *cmd = NULL;
+
+    if      (skill_str_has(s, "ล้าง")     || skill_str_has(s, "เคลียร์") || skill_str_has(s, "clear"))       cmd = "/clear";
+    else if (skill_str_has(s, "รีบูต")    || skill_str_has(s, "รีสตาร์ท") || skill_str_has(s, "reboot")
+          || skill_str_has(s, "restart"))                                                                    cmd = "/reboot";
+    else if (skill_str_has(s, "ปิดเครื่อง") || skill_str_has(s, "ชัตดาวน์") || skill_str_has(s, "shutdown")
+          || skill_str_has(s, "power off"))                                                                  cmd = "/shutdown";
+    else if (skill_str_has(s, "ช่วยเหลือ") || skill_str_has(s, "วิธีใช้") || skill_str_has(s, "help"))        cmd = "/help";
+    else if (skill_str_has(s, "เกม")      || skill_str_has(s, "games")    || skill_str_has(s, "game"))       cmd = "/games";
+    else if (skill_str_has(s, "เพลง")     || skill_str_has(s, "songs")    || skill_str_has(s, "song"))       cmd = "/songs";
+
+    if (cmd == NULL) return NULL;
+
+    /* copy into a writable buffer: process_slash_command splits it in place */
+    int n = 0;
+    while (cmd[n] && n < (int)sizeof(gSkillCmdBuf) - 1) { gSkillCmdBuf[n] = cmd[n]; n++; }
+    gSkillCmdBuf[n] = '\0';
+    return gSkillCmdBuf;
+}
+
 static void gui_send(void) {
     if (gInputLen == 0) return;
     gInputBuf[gInputLen] = '\0';
@@ -6355,24 +6761,32 @@ static void gui_send(void) {
             gui_chat_show_usage();
             gui_set_emotion(EMOTION_HAPPY);
         } else {
-            int ki = kb_lookup(gInputBuf);                     /* answer from KB   */
-            if (ki >= 0) {
+            char *skill_cmd = gui_skill_command(gInputBuf);
+            if (skill_cmd != NULL) {
+                /* natural-language skill request (e.g. "ล้างหน้าจอหน่อย") */
                 uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
-                gui_chat_add(g_kb[ki].a);
+                process_slash_command(skill_cmd);
                 gui_set_emotion(EMOTION_HAPPY);
             } else {
-                /* KB miss: fall back to real model generation (captured into
-                 * gGenBuf, then routed into the chat log). */
-                gui_repaint_chat();   /* show "You: ..." + thinking face first */
-                gGenCapture = 1;
-                generate(&gTransformer, &gTokenizer, &gSampler, gInputBuf, GUI_GEN_STEPS);
-                gGenCapture = 0;
-                if (gGenLen > 0) {
-                    gui_chat_add(gGenBuf);
+                int ki = kb_lookup(gInputBuf);                 /* answer from KB */
+                if (ki >= 0) {
+                    uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
+                    gui_chat_add(g_kb[ki].a);
                     gui_set_emotion(EMOTION_HAPPY);
                 } else {
-                    gui_chat_add("ไม่ทราบ");
-                    gui_set_emotion(EMOTION_CONFUSED);
+                    /* KB miss: fall back to real model generation (captured into
+                     * gGenBuf, then routed into the chat log). */
+                    gui_repaint_chat();   /* show "You: ..." + thinking face first */
+                    gGenCapture = 1;
+                    generate(&gTransformer, &gTokenizer, &gSampler, gInputBuf, GUI_GEN_STEPS);
+                    gGenCapture = 0;
+                    if (gGenLen > 0) {
+                        gui_chat_add(gGenBuf);
+                        gui_set_emotion(EMOTION_HAPPY);
+                    } else {
+                        gui_chat_add("ไม่ทราบ");
+                        gui_set_emotion(EMOTION_CONFUSED);
+                    }
                 }
             }
         }
@@ -6583,7 +6997,7 @@ static int mouse_has_activity(void) {
 
 static void gui_init(void) {
     gui_init_colors();
-    gui_layout();
+    calculate_ui_layout();
     init_mouse();
     if (mouse_available()) {        /* position the pointer at screen centre   */
         gMouseX = (int)gFbWidth / 2;
@@ -6797,6 +7211,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         fb_puts("error: could not open the boot volume\n");
         return EFI_LOAD_ERROR;
     }
+    gBootRoot = root;   // cache it for append_to_file() / load_file_to_memory()
 
     // read the checkpoint into pool memory (see read_file: FreePages hangs OVMF)
     VOID *checkpoint_data = NULL;
@@ -6815,6 +7230,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         fb_puts("error: invalid model checkpoint\n");
         return EFI_LOAD_ERROR;
     }
+    /* initialise the multi-turn conversation context */
+    chat_context_reset();
+    gCtxSeqLen = (gTransformer.config.seq_len < CHAT_CTX_MAX)
+               ? gTransformer.config.seq_len : CHAT_CTX_MAX;
     if (steps == 0 || steps > gTransformer.config.seq_len) {
         steps = gTransformer.config.seq_len; // override to ~max length
     }
