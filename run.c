@@ -2810,6 +2810,7 @@ static Tokenizer   gTokenizer;            /* tokenizer for the active vocab size
 static Sampler     gSampler;              /* sampling params + probindex buffer */
 static VOID       *gTokenizerData = NULL; /* raw tokenizer.bin buffer (shared)  */
 static int         gModelLoaded    = 0;   /* gTransformer holds a live model    */
+static char        gModelName[64]  = "stories15M_thai_q80.bin"; /* active ckpt  */
 static float       gTemperature    = 1.0f;
 static float       gTopp           = 0.9f;
 static unsigned long long gSeed    = 1337;
@@ -3709,6 +3710,11 @@ static void load_new_model(const char *filename) {
     if (gModelLoaded) free_transformer(&gTransformer);
     gTransformer = next;
     gModelLoaded = 1;
+
+    /* remember which checkpoint is active, so "ใช้โมเดลอะไร" answers truthfully */
+    int mn = 0;
+    while (filename[mn] && mn < (int)sizeof(gModelName) - 1) { gModelName[mn] = filename[mn]; mn++; }
+    gModelName[mn] = '\0';
 
     /* New model -> new KV cache, so the old conversation is meaningless. */
     chat_context_reset();
@@ -6735,6 +6741,37 @@ static char *gui_skill_command(const char *s) {
     return gSkillCmdBuf;
 }
 
+/* Build the "what model am I using" answer from the live config. */
+static char gModelInfo[160];
+
+static char *gui_model_answer(void) {
+    int n = 0;
+    const char *p;
+    for (p = "ใช้โมเดล "; *p; p++) gModelInfo[n++] = *p;
+    for (p = gModelName; *p; p++) gModelInfo[n++] = *p;
+    for (p = " (dim="; *p; p++) gModelInfo[n++] = *p;
+    gui_itoa(gTransformer.config.dim, gModelInfo + n); while (gModelInfo[n]) n++;
+    for (p = " vocab="; *p; p++) gModelInfo[n++] = *p;
+    gui_itoa(gTransformer.config.vocab_size, gModelInfo + n); while (gModelInfo[n]) n++;
+    for (p = " seq_len="; *p; p++) gModelInfo[n++] = *p;
+    gui_itoa(gTransformer.config.seq_len, gModelInfo + n); while (gModelInfo[n]) n++;
+    gModelInfo[n++] = ')';
+    gModelInfo[n] = '\0';
+    return gModelInfo;
+}
+
+/* True when `s` asks which model is currently loaded. */
+static int gui_is_model_question(const char *s) {
+    if (s == NULL) return 0;
+    if (skill_str_has(s, "โมเดล") && (skill_str_has(s, "อะไร") || skill_str_has(s, "ไหน")))
+        return 1;
+    if (skill_str_has(s, "รุ่นไหน") || skill_str_has(s, "รุ่นอะไร")) return 1;
+    if (skill_str_has(s, "model") &&
+        (skill_str_has(s, "what") || skill_str_has(s, "which") || skill_str_has(s, "using")))
+        return 1;
+    return 0;
+}
+
 static void gui_send(void) {
     if (gInputLen == 0) return;
     gInputBuf[gInputLen] = '\0';
@@ -6759,6 +6796,11 @@ static void gui_send(void) {
             uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
             gui_chat_add("สวัสดีครับ ผมเป็นเอไอภาษาไทย");
             gui_chat_show_usage();
+            gui_set_emotion(EMOTION_HAPPY);
+        } else if (gui_is_model_question(gInputBuf)) {
+            /* "ใช้โมเดลอะไร" -> answer from the live config, not the LLM */
+            uefi_call_wrapper(BS->Stall, 1, EMOTION_THINK_US);
+            gui_chat_add(gui_model_answer());
             gui_set_emotion(EMOTION_HAPPY);
         } else {
             char *skill_cmd = gui_skill_command(gInputBuf);
